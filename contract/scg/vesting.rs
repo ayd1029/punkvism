@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
-declare_id!("83S74WYJ6zYoZBcaRkrk8ELiYSosHxs8oocjGa8Kgb5b");
+declare_id!("BmHxB7e3UYFyvtB1hUQx3ZyjUrh9StnBFNvMm7TF2eeE");
 
 const CATEGORY_MAX_LEN: usize = 50;
 const DISCRIMINATOR_SIZE: usize = 8;
@@ -25,8 +25,15 @@ const VESTING_ACCOUNT_SPACE: usize = DISCRIMINATOR_SIZE
     + 32; // destination_token_account (Pubkey)
 
 #[program]
-pub mod vesting_test {
+pub mod vesting {
     use super::*;
+    // deployer admin 설정
+    pub fn initialize_deployer(ctx: Context<InitializeDeployer>) -> Result<()> {
+        let deployer_admin = &mut ctx.accounts.deploy_admin;
+        deployer_admin.deployer = ctx.accounts.deployer.key();
+        Ok(())
+    }
+
     // admin 계정 설정
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
         let admin_config = &mut ctx.accounts.admin_config;
@@ -37,7 +44,13 @@ pub mod vesting_test {
     pub fn do_vesting(ctx: Context<DoVesting>, amount: u64) -> Result<()> {
         let now = Clock::get()?;
         let vesting_account = &mut ctx.accounts.vesting_account;
+        let admin = &ctx.accounts.admin;
+        let admin_config = &ctx.accounts.admin_config;
 
+        require!(
+            admin_config.admin == admin.key(),
+            VestingError::Unauthorized
+        );
         require!(vesting_account.is_active, VestingError::NotActive);
         require!(
             vesting_account.last_release_time <= now.unix_timestamp,
@@ -105,10 +118,10 @@ pub mod vesting_test {
 
         // 파라미터 유효성 검사
         require!(params.total_amount > 0, VestingError::InvalidParameters);
-        require!(
-            params.end_time > clock.unix_timestamp,
-            VestingError::InvalidParameters
-        );
+        // require!(
+        //     params.end_time > clock.unix_timestamp,
+        //     VestingError::InvalidParameters
+        // );
         require!(
             params.initial_unlock <= params.total_amount,
             VestingError::InvalidParameters
@@ -149,15 +162,10 @@ pub mod vesting_test {
 
         Ok(())
     }
-    // 아직 사용하고 있지 않은 함수
+    // 긴급 정지 함수 (is_active 상태 변경)
     pub fn emergency_stop(ctx: Context<EmergencyStop>) -> Result<()> {
-        require!(
-            ctx.accounts.admin.key() == ctx.accounts.vesting_account.beneficiary,
-            VestingError::Unauthorized
-        );
-
         let vesting_account = &mut ctx.accounts.vesting_account;
-        vesting_account.is_active = false;
+        vesting_account.is_active = !vesting_account.is_active; // 토글 기능
 
         emit!(EmergencyStopped {
             vesting_account: ctx.accounts.vesting_account.key(),
@@ -194,7 +202,7 @@ pub mod vesting_test {
         })
     }
 
-    // 수혜저 지갑 업데이트
+    // 수혜자 지갑 업데이트
     pub fn update_beneficiary(ctx: Context<UpdateBeneficiary>) -> Result<()> {
         let vesting_account = &mut ctx.accounts.vesting_account;
 
@@ -297,6 +305,10 @@ pub mod vesting_test {
         Ok(())
     }
 
+    pub fn close_vesting_account(ctx: Context<CloseVestingAccount>) -> Result<()> {
+        Ok(())
+    }
+
     pub fn update_vesting_time(
         ctx: Context<UpdateVestingInfo>,
         args: UpdateVestingTimeArgs,
@@ -309,10 +321,14 @@ pub mod vesting_test {
         Ok(())
     }
 
-    pub fn close_vesting_account(ctx: Context<CloseVestingAccount>) -> Result<()> {
+    pub fn remove_admin(ctx: Context<RemoveAdmin>) -> Result<()> {
+        require!(
+            ctx.accounts.deployer_admin.deployer == ctx.accounts.deployer.key(),
+            VestingError::NotDeployAdmin
+        );
+
         Ok(())
     }
-
 }
 
 // 베스팅 정보 저장
@@ -339,6 +355,28 @@ pub struct VestingAccount {
 #[account]
 pub struct AdminConfig {
     pub admin: Pubkey,
+}
+
+#[account]
+pub struct DeployAdmin {
+    pub deployer: Pubkey,
+}
+
+#[derive(Accounts)]
+pub struct InitializeDeployer<'info> {
+    #[account(mut)]
+    pub deployer: Signer<'info>, // 배포자 = signer
+
+    #[account(
+        init,
+        payer = deployer,
+        space = 8 + 32, // discriminator + pubkey
+        seeds = [b"deploy_admin"],
+        bump
+    )]
+    pub deploy_admin: Account<'info, DeployAdmin>,
+
+    pub system_program: Program<'info, System>,
 }
 
 // 프로그램 초기화 시 admin 설정을 위한 구조체
@@ -383,6 +421,13 @@ pub struct DoVesting<'info> {
         bump
     )]
     pub vesting_account: Account<'info, VestingAccount>,
+
+    #[account(
+        has_one = admin @ VestingError::Unauthorized,
+        seeds = [b"admin", admin.key().as_ref()],
+        bump
+    )]
+    pub admin_config: Account<'info, AdminConfig>,
 
     /// CHECK: 수혜자
     pub beneficiary: AccountInfo<'info>,
@@ -486,12 +531,25 @@ pub struct CreateVesting<'info> {
 }
 #[derive(Accounts)]
 pub struct EmergencyStop<'info> {
+    #[account(mut)]
     pub admin: Signer<'info>,
 
     #[account(
-        mut,
-        seeds = [b"vesting", vesting_account.beneficiary.as_ref(), vesting_account.token_mint.as_ref()],
+        has_one = admin @ VestingError::Unauthorized,
+        seeds = [b"admin", admin.key().as_ref()],
         bump
+    )]
+    pub admin_config: Account<'info, AdminConfig>,
+
+    /// CHECK: beneficiary account
+    pub beneficiary: AccountInfo<'info>,
+
+    pub token_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        constraint = vesting_account.beneficiary == beneficiary.key() @ VestingError::Unauthorized,
+        constraint = vesting_account.token_mint == token_mint.key() @ VestingError::Unauthorized
     )]
     pub vesting_account: Account<'info, VestingAccount>,
 }
@@ -603,6 +661,28 @@ pub struct UpdateVestingTimeArgs {
     pub new_end_time: i64,
 }
 
+#[derive(Accounts)]
+pub struct RemoveAdmin<'info> {
+    #[account(mut)]
+    pub deployer: Signer<'info>,
+
+    #[account(
+        seeds = [b"deploy_admin"],
+        bump
+    )]
+    pub deployer_admin: Account<'info, DeployAdmin>,
+
+    pub admin: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        close = deployer,
+        seeds = [b"admin", admin.key().as_ref()],
+        bump
+    )]
+    pub admin_config: Account<'info, AdminConfig>,
+}
+
 #[event]
 pub struct VestingUpdated {
     pub vesting_account: Pubkey,
@@ -640,14 +720,6 @@ pub struct EmergencyStopped {
 }
 
 #[event]
-pub struct DestinationChanged {
-    pub vesting_account: Pubkey,
-    pub old_destination: Pubkey,
-    pub new_destination: Pubkey,
-    pub timestamp: i64,
-}
-
-#[event]
 pub struct BeneficiaryUpdated {
     pub vesting_account: Pubkey,
     pub old_beneficiary: Pubkey,
@@ -670,4 +742,6 @@ pub enum VestingError {
     InvalidParameters,
     #[msg("Add amount is overflow")]
     Overflow,
+    #[msg("You are not the deployer admin.")]
+    NotDeployAdmin,
 }
