@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
-declare_id!("EsBXrK3qZJzPGkiqMesZeKXPTrJk9FU2X95TgiLCnfQA");
+declare_id!("Dys2dk3skG19k2xgPFTCLx3Ky4Mf1wkkePYNCpAyYKNt");
 
 const CATEGORY_MAX_LEN: usize = 50;
 const DISCRIMINATOR_SIZE: usize = 8;
@@ -67,6 +67,8 @@ pub mod vesting {
             .iter_mut()
             .find(|p| p.release_time == vesting_time)
             .ok_or(VestingError::InvalidParameters)?;
+
+        require!(!plan.released, VestingError::AlreadyReleased);
         require!(plan.amount == amount, VestingError::InvalidParameters);
 
         let admin_key = ctx.accounts.admin.key();
@@ -139,6 +141,11 @@ pub mod vesting {
         //     VestingError::InvalidParameters
         // );
 
+        let amount_to_transfer = params
+            .total_amount
+            .checked_sub(params.released_amount)
+            .ok_or(VestingError::InvalidParameters)?;
+
         vesting_account.beneficiary = ctx.accounts.beneficiary.key(); // 토큰 수령 주소
         vesting_account.total_amount = params.total_amount; // 전체 베스팅 토큰 수량
         vesting_account.released_amount = params.released_amount; // 언락 토큰 수량
@@ -179,16 +186,8 @@ pub mod vesting {
                 },
                 &[signer_seeds],
             ),
-            params.total_amount,
+            amount_to_transfer,
         )?;
-
-        emit!(VestingCreated {
-            beneficiary: ctx.accounts.beneficiary.key(),
-            total_amount: params.total_amount,
-            start_time: vesting_account.start_time,
-            category: params.category.clone(),
-            updated_timestamp: Some(Clock::get()?.unix_timestamp),
-        });
 
         Ok(())
     }
@@ -197,7 +196,6 @@ pub mod vesting {
         ctx: Context<UserCreateVesting>,
         params: VestingParams,
     ) -> Result<()> {
-        let _vesting_account_info = ctx.accounts.vesting_account.to_account_info();
         let vesting_account = &mut ctx.accounts.vesting_account;
         let _clock = Clock::get()?;
 
@@ -209,24 +207,14 @@ pub mod vesting {
 
         // 파라미터 유효성 검사
         require!(params.total_amount > 0, VestingError::InvalidParameters);
-        // require!(
-        //     params.end_time > clock.unix_timestamp,
-        //     VestingError::InvalidParameters
-        // );
 
         let plans = &mut ctx.accounts.parent_plan_chunk.plans;
         require!(!plans.is_empty(), VestingError::ParentPlanNotFound);
 
-        let first_plan = &mut plans[0];
-        require!(
-            first_plan.amount >= params.total_amount,
-            VestingError::InsufficientAmount
-        );
-
-        first_plan.amount = first_plan
-            .amount
-            .checked_sub(params.total_amount)
-            .ok_or(VestingError::Overflow)?;
+        let amount_to_transfer = params
+            .total_amount
+            .checked_sub(params.released_amount)
+            .ok_or(VestingError::InvalidParameters)?;
 
         vesting_account.beneficiary = ctx.accounts.beneficiary.key(); // 토큰 수령 주소
         vesting_account.total_amount = params.total_amount; // 전체 베스팅 토큰 수량
@@ -268,16 +256,8 @@ pub mod vesting {
                 },
                 &[signer_seeds],
             ),
-            params.total_amount,
+            amount_to_transfer,
         )?;
-
-        emit!(VestingCreated {
-            beneficiary: ctx.accounts.beneficiary.key(),
-            total_amount: params.total_amount,
-            start_time: vesting_account.start_time,
-            category: params.category.clone(),
-            updated_timestamp: Some(Clock::get()?.unix_timestamp),
-        });
 
         Ok(())
     }
@@ -287,6 +267,69 @@ pub mod vesting {
         plans: Vec<YearlyPlan>,
     ) -> Result<()> {
         let chunk = &mut ctx.accounts.plan_chunk;
+        let deduct = ctx.accounts.token_vault.key() != ctx.accounts.parent_vault.key();
+
+        if deduct {
+            let parent_chunk = ctx
+                .accounts
+                .parent_plan_chunk
+                .as_deref_mut()
+                .ok_or(VestingError::ParentPlanNotFound)?;
+
+            let user_tge_time = plans.first().map(|p| p.release_time);
+            let parent_tge_time = parent_chunk.plans.first().map(|p| p.release_time);
+            let tge_equal = user_tge_time == parent_tge_time;
+
+            if tge_equal {
+                // TGE 같으면 1:1 매칭 (released == false인 것만 차감)
+                for (user_plan, parent_plan) in plans.iter().zip(parent_chunk.plans.iter_mut()) {
+                    if !user_plan.released && !parent_plan.released {
+                        require!(
+                            parent_plan.amount >= user_plan.amount,
+                            VestingError::InsufficientAmount
+                        );
+
+                        parent_plan.amount = parent_plan
+                            .amount
+                            .checked_sub(user_plan.amount)
+                            .ok_or(VestingError::Overflow)?;
+                    }
+                }
+            } else {
+                // TGE 다르면: user false[0]부터, parent false[1]부터 매칭해서 차감
+                // 유저의 released == false 플랜만 추출
+                let user_unreleased: Vec<&YearlyPlan> =
+                    plans.iter().filter(|p| !p.released).collect();
+                let parent_unreleased: Vec<&mut YearlyPlan> = parent_chunk
+                    .plans
+                    .iter_mut()
+                    .filter(|p| !p.released)
+                    .collect();
+
+                // 유저 0부터, 재단 1부터 1:1 대응
+                let mut parent_iter = parent_unreleased.into_iter().skip(1);
+
+                for user_plan in user_unreleased {
+                    if let Some(parent_plan) = parent_iter.next() {
+                        // 재단 amount가 부족한 경우 에러 반환
+                        require!(
+                            parent_plan.amount >= user_plan.amount,
+                            VestingError::InsufficientAmount
+                        );
+
+                        // 0이라도 동일하게 차감 처리
+                        parent_plan.amount = parent_plan
+                            .amount
+                            .checked_sub(user_plan.amount)
+                            .ok_or(VestingError::Overflow)?;
+                    } else {
+                        // 재단 플랜이 부족하면 더 이상 차감하지 않고 종료
+                        break;
+                    }
+                }
+            }
+        }
+
         chunk.vesting_account = ctx.accounts.vesting_account.key();
         chunk.plans.extend(plans);
         Ok(())
@@ -305,11 +348,6 @@ pub mod vesting {
     pub fn emergency_stop(ctx: Context<EmergencyStop>) -> Result<()> {
         let vesting_account = &mut ctx.accounts.vesting_account;
         vesting_account.is_active = !vesting_account.is_active; // 토글 기능
-
-        emit!(EmergencyStopped {
-            vesting_account: ctx.accounts.vesting_account.key(),
-            timestamp: Clock::get()?.unix_timestamp,
-        });
 
         Ok(())
     }
@@ -345,14 +383,6 @@ pub mod vesting {
         vesting_account.beneficiary = ctx.accounts.new_beneficiary.key();
         vesting_account.destination_token_account =
             ctx.accounts.new_beneficiary_token_account.key();
-
-        emit!(BeneficiaryUpdated {
-            vesting_account: ctx.accounts.vesting_account.key(),
-            old_beneficiary: ctx.accounts.old_beneficiary.key(),
-            new_beneficiary: ctx.accounts.new_beneficiary.key(),
-            new_destination: ctx.accounts.new_beneficiary_token_account.key(),
-            timestamp: Clock::get()?.unix_timestamp,
-        });
 
         Ok(())
     }
@@ -409,18 +439,6 @@ pub mod vesting {
         // if let Some(updated_timestamp) = params.updated_timestamp {
         //     vesting_account.updated_timestamp = Some(updated_timestamp);
         // }
-
-        emit!(VestingUpdated {
-            vesting_account: vesting_account.key(),
-            total_amount: vesting_account.total_amount,
-            released_amount: vesting_account.released_amount,
-            start_time: vesting_account.start_time,
-            end_time: vesting_account.end_time,
-            token_mint: vesting_account.token_mint,
-            token_vault: vesting_account.token_vault,
-            category: vesting_account.category.clone(),
-            updated_timestamp: Some(Clock::get()?.unix_timestamp),
-        });
 
         Ok(())
     }
@@ -767,6 +785,12 @@ pub struct AppendYearlyPlan<'info> {
     pub plan_chunk: Account<'info, VestingPlanChunk>,
 
     #[account(mut)]
+    pub parent_plan_chunk: Option<Account<'info, VestingPlanChunk>>,
+
+    pub token_vault: AccountInfo<'info>,
+    pub parent_vault: AccountInfo<'info>,
+
+    #[account(mut)]
     pub admin: Signer<'info>,
 
     pub system_program: Program<'info, System>,
@@ -896,6 +920,14 @@ pub struct CloseVestingAccount<'info> {
 
     #[account(mut, close = admin)]
     pub vesting_account: Account<'info, VestingAccount>,
+
+    #[account(
+        mut,
+        close = admin,
+        seeds = [b"plans", vesting_account.key().as_ref()],
+        bump
+    )]
+    pub plan_chunk: Account<'info, VestingPlanChunk>,
     pub system_program: Program<'info, System>,
 }
 
@@ -927,42 +959,6 @@ pub struct RemoveAdmin<'info> {
     pub admin_config: Account<'info, AdminConfig>,
 }
 
-#[event]
-pub struct VestingUpdated {
-    pub vesting_account: Pubkey,
-    pub total_amount: u64,
-    pub released_amount: u64,
-    pub start_time: i64,
-    pub end_time: i64,
-    pub token_mint: Pubkey,
-    pub token_vault: Pubkey,
-    pub category: String,
-    pub updated_timestamp: Option<i64>,
-}
-#[event]
-pub struct VestingCreated {
-    pub beneficiary: Pubkey,
-    pub total_amount: u64,
-    pub start_time: i64,
-    pub category: String,
-    pub updated_timestamp: Option<i64>,
-}
-
-#[event]
-pub struct EmergencyStopped {
-    pub vesting_account: Pubkey,
-    pub timestamp: i64,
-}
-
-#[event]
-pub struct BeneficiaryUpdated {
-    pub vesting_account: Pubkey,
-    pub old_beneficiary: Pubkey,
-    pub new_beneficiary: Pubkey,
-    pub new_destination: Pubkey,
-    pub timestamp: i64,
-}
-
 #[error_code]
 pub enum VestingError {
     #[msg("Veseting period has not ended yet")]
@@ -983,4 +979,6 @@ pub enum VestingError {
     ParentPlanNotFound,
     #[msg("Insufficient amount in the parent vesting plan.")]
     InsufficientAmount,
+    #[msg("Vesting for the specified time has already been completed.")]
+    AlreadyReleased,
 }
