@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
-declare_id!("Dys2dk3skG19k2xgPFTCLx3Ky4Mf1wkkePYNCpAyYKNt");
+declare_id!("DcjmKSSKNxbSAwBQZx8wSAhosxBxQoyz3DdXuysMiPTy");
 
 const CATEGORY_MAX_LEN: usize = 50;
 const DISCRIMINATOR_SIZE: usize = 8;
