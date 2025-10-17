@@ -7,7 +7,7 @@ declare_id!("C62mtnzjSQ4M5yFJ7GguqVNpno2r85qcybcJpaj1e9v3"); // Declare program 
 const CATEGORY_MAX_LEN: usize = 50;                   // Maximum length for the category string
 const DISCRIMINATOR_SIZE: usize = 8;                  // Anchor account discriminator (8 bytes)
 const STRING_LENGTH_PREFIX: usize = 4; // String length prefix (u32) - Anchor prepends this during String serialization
-
+const MAX_PLANS: usize = 52;                          // Maximum number of yearly plans in a chunk
 const VESTING_ACCOUNT_SPACE: usize = DISCRIMINATOR_SIZE
     + 32  // beneficiary (Pubkey)
     + 8   // total_amount
@@ -364,6 +364,9 @@ pub mod vesting {                                      // Start of the Anchor pr
         );
 
         let chunk = &mut ctx.accounts.plan_chunk;                       // Target plan chunk
+        
+        require!(chunk.plans.len() + plans.len() <= MAX_PLANS, VestingError::InsufficientSpace);
+        
         let deduct = ctx.accounts.vesting_account.token_vault.key()
             != ctx.accounts.vesting_account.parent_vault.key();         // Perform parent deduction if different from parent vault
 
@@ -831,7 +834,7 @@ pub struct AppendYearlyPlan<'info> {               // append_yearly_plan context
     #[account(
         init_if_needed,
         payer = admin,
-        space = 8 + 32 + 4 + (52 * (8 + 8 + 1)),   // Assuming approx. 52 plans (size calculation in comments)
+        space = 8 + 32 + 4 + (MAX_PLANS * (8 + 8 + 1)),   // MAX 52 plans (size calculation in comments)
         seeds = [b"plans", vesting_account.key().as_ref()],
         bump
     )]
@@ -1042,4 +1045,6 @@ pub enum VestingError {                           // Custom error definitions
     VaultNotEmpty,                                // Vault must have a zero balance
     #[msg("Invalid Mint")]
     InvalidMint,                                  // Mint mismatch
+    #[msg("Plans can be appended up to 52")]
+    InsufficientSpace
 }
