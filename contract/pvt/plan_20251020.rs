@@ -5,6 +5,8 @@ use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer}; // Types/fun
 declare_id!("C62mtnzjSQ4M5yFJ7GguqVNpno2r85qcybcJpaj1e9v3"); // Declare program ID (on-chain program id)
 
 const CATEGORY_MAX_LEN: usize = 50;                   // Maximum length for the category string
+const TOKEN_NAME_MAX_LEN: usize = 32;                 // Maximum length for the token name string
+const TOKEN_SYMBOL_MAX_LEN: usize = 10;               // Maximum length for the token symbol string
 const DISCRIMINATOR_SIZE: usize = 8;                  // Anchor account discriminator (8 bytes)
 const STRING_LENGTH_PREFIX: usize = 4; // String length prefix (u32) - Anchor prepends this during String serialization
 const MAX_PLANS: usize = 52;                          // Maximum number of yearly plans in a chunk
@@ -457,12 +459,30 @@ pub mod vesting {                                      // Start of the Anchor pr
             VestingError::Unauthorized
         );
 
-        let token_info = &mut ctx.accounts.token_info;                 // TokenInfo PDA
+        // Validate inputs
+        require!(
+            args.token_name.len() <= TOKEN_NAME_MAX_LEN,
+            VestingError::InvalidParameters
+        );
+        require!(
+            args.token_symbol.len() <= TOKEN_SYMBOL_MAX_LEN,
+            VestingError::InvalidParameters
+        );
 
-        token_info.token_name = args.token_name;                       // Set name/symbol/total supply/mint/minting wallet
+        // Validate that the provided mint_wallet_address is the actual mint authority
+        let mint_authority = ctx.accounts.token_mint.mint_authority.ok_or(VestingError::InvalidMint)?;
+        require!(
+            mint_authority == args.mint_wallet_address,
+            VestingError::Unauthorized
+        );
+
+        let token_info = &mut ctx.accounts.token_info;
+
+        token_info.token_name = args.token_name;
         token_info.token_symbol = args.token_symbol;
         token_info.total_supply = args.total_supply;
-        token_info.token_mint = args.token_mint;
+        // Set the token_mint from the context, not from args, to prevent mismatch
+        token_info.token_mint = ctx.accounts.token_mint.key();
         token_info.mint_wallet_address = args.mint_wallet_address;
 
         Ok(())
@@ -1030,7 +1050,6 @@ pub struct TokenInfoArgs {                        // Input parameters for init_t
     pub token_name: String,
     pub token_symbol: String,
     pub total_supply: u64,
-    pub token_mint: Pubkey,
     pub mint_wallet_address: Pubkey,
 }
 
@@ -1042,7 +1061,12 @@ pub struct InitTokenInfo<'info> {                 // init_token_info context
     #[account(
         init,
         payer = scheduler_admin,
-        space = 8 + 4 + 32 + 4 + 10 + 8 + 32 + 32, // Approximate space calculation (including String length prefix)
+        space = DISCRIMINATOR_SIZE 
+            + (STRING_LENGTH_PREFIX + TOKEN_NAME_MAX_LEN) 
+            + (STRING_LENGTH_PREFIX + TOKEN_SYMBOL_MAX_LEN) 
+            + 8  // total_supply
+            + 32 // token_mint
+            + 32, // mint_wallet_address (including String length prefix)
         seeds = [b"token_info", scheduler_admin.key().as_ref(), token_mint.key().as_ref()],
         bump
     )]
