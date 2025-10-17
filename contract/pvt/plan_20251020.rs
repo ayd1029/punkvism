@@ -447,6 +447,7 @@ pub mod vesting {                                      // Start of the Anchor pr
     }
 
     pub fn update_plan_chunk(ctx: Context<UpdatePlanChunk>, plans: Vec<YearlyPlan>) -> Result<()> { // Replace all plans
+        require!(plans.len() <= MAX_PLANS, VestingError::InsufficientSpace);
         let plan_chunk = &mut ctx.accounts.plan_chunk;
 
         plan_chunk.plans.clear();                                     // Delete existing
