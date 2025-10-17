@@ -363,82 +363,27 @@ pub mod vesting {                                      // Start of the Anchor pr
             VestingError::Unauthorized
         );
 
-        let chunk = &mut ctx.accounts.plan_chunk;                       // Target plan chunk
-        
-        require!(chunk.plans.len() + plans.len() <= MAX_PLANS, VestingError::InsufficientSpace);
-        
+        let chunk = &mut ctx.accounts.plan_chunk;
         let deduct = ctx.accounts.vesting_account.token_vault.key()
             != ctx.accounts.vesting_account.parent_vault.key();         // Perform parent deduction if different from parent vault
 
         if deduct {
+            // Check if owned by this program
+            let parent_chunk_info = ctx
+                .accounts
+                .parent_plan_chunk
+                .as_ref()
+                .ok_or(VestingError::ParentPlanNotFound)?
+                .to_account_info();
+            require!(parent_chunk_info.owner == ctx.program_id, VestingError::Unauthorized);
+
             let parent_chunk = ctx
                 .accounts
                 .parent_plan_chunk
-                .as_mut()
-                .ok_or(VestingError::ParentPlanNotFound)?;              // Check for parent plan existence
+                .as_deref_mut()
+                .ok_or(VestingError::ParentPlanNotFound)?;
 
-            // Check if owned by this program
-            require!(
-                parent_chunk.to_account_info().owner == ctx.program_id,
-                VestingError::Unauthorized
-            );
-            
-            let user_tge_time = plans.first().map(|p| p.release_time);  // User plan first release (assuming TGE)
-            let parent_tge_time = parent_chunk.plans.first().map(|p| p.release_time); // Parent first release
-            let tge_equal = user_tge_time == parent_tge_time;           // Check if TGE is the same
-
-            if tge_equal {
-                require!(
-                    plans.len() == parent_chunk.plans.len(),
-                    VestingError::InvalidParameters
-                );
-                // If TGE is the same, 1:1 matching (deduct only for released == false)
-                for (user_plan, parent_plan) in plans.iter().zip(parent_chunk.plans.iter_mut()) {
-                    if !user_plan.released && !parent_plan.released {
-                        require!(
-                            parent_plan.amount >= user_plan.amount,
-                            VestingError::InsufficientAmount
-                        );
-
-                        parent_plan.amount = parent_plan
-                            .amount
-                            .checked_sub(user_plan.amount)
-                            .ok_or(VestingError::Overflow)?;           // Deduct amount from parent plan
-                    }
-                }
-            } else {
-                // If TGE is different: match and deduct from user false[0] and parent false[1]
-                // Extract only user plans where released == false
-                let user_unreleased: Vec<&YearlyPlan> =
-                    plans.iter().filter(|p| !p.released).collect();
-                let parent_unreleased: Vec<&mut YearlyPlan> = parent_chunk
-                    .plans
-                    .iter_mut()
-                    .filter(|p| !p.released)
-                    .collect();
-
-                // 1:1 correspondence from user 0, foundation 1
-                let mut parent_iter = parent_unreleased.into_iter().skip(1);
-
-                for user_plan in user_unreleased {
-                    if let Some(parent_plan) = parent_iter.next() {
-                        // Return error if foundation amount is insufficient
-                        require!(
-                            parent_plan.amount >= user_plan.amount,
-                            VestingError::InsufficientAmount
-                        );
-
-                        // Process deduction identically even if it's 0
-                        parent_plan.amount = parent_plan
-                            .amount
-                            .checked_sub(user_plan.amount)
-                            .ok_or(VestingError::Overflow)?;
-                    } else {
-                        // If foundation plan is insufficient, stop further deductions and exit
-                        break;
-                    }
-                }
-            }
+            deduct_from_parent(parent_chunk, &plans)?;
         }
 
         chunk.vesting_account = ctx.accounts.vesting_account.key(); // Indicate the owning vesting account
@@ -447,11 +392,40 @@ pub mod vesting {                                      // Start of the Anchor pr
     }
 
     pub fn update_plan_chunk(ctx: Context<UpdatePlanChunk>, plans: Vec<YearlyPlan>) -> Result<()> { // Replace all plans
-        require!(plans.len() <= MAX_PLANS, VestingError::InsufficientSpace);
-        let plan_chunk = &mut ctx.accounts.plan_chunk;
+        require!(
+            ctx.accounts.admin_config.admin == ctx.accounts.admin.key(),
+            VestingError::Unauthorized
+        );
 
-        plan_chunk.plans.clear();                                     // Delete existing
-        plan_chunk.plans.extend(plans);                               // Refill with new
+        let plan_chunk = &mut ctx.accounts.plan_chunk;
+        let deduct = ctx.accounts.vesting_account.token_vault.key()
+            != ctx.accounts.vesting_account.parent_vault.key();
+
+        if deduct {
+            let parent_chunk_info = ctx
+                .accounts
+                .parent_plan_chunk
+                .as_ref()
+                .ok_or(VestingError::ParentPlanNotFound)?
+                .to_account_info();
+            require!(parent_chunk_info.owner == ctx.program_id, VestingError::Unauthorized);
+
+            let parent_chunk = ctx
+                .accounts
+                .parent_plan_chunk
+                .as_deref_mut()
+                .ok_or(VestingError::ParentPlanNotFound)?;
+
+            // "Refund" old plans
+            let old_plans = plan_chunk.plans.clone();
+            refund_to_parent(parent_chunk, &old_plans)?;
+
+            // "Deduct" new plans
+            deduct_from_parent(parent_chunk, &plans)?;
+        }
+
+        plan_chunk.plans.clear();
+        plan_chunk.plans.extend(plans);
 
         Ok(())
     }
@@ -493,7 +467,62 @@ pub mod vesting {                                      // Start of the Anchor pr
 
         Ok(())
     }
+}
 
+fn deduct_from_parent(parent_chunk: &mut VestingPlanChunk, user_plans: &[YearlyPlan]) -> Result<()> {
+    let user_tge_time = user_plans.first().map(|p| p.release_time);
+    let parent_tge_time = parent_chunk.plans.first().map(|p| p.release_time);
+    let tge_equal = user_tge_time == parent_tge_time;
+
+    if tge_equal {
+        for (user_plan, parent_plan) in user_plans.iter().zip(parent_chunk.plans.iter_mut()) {
+            if !user_plan.released && !parent_plan.released {
+                require!(parent_plan.amount >= user_plan.amount, VestingError::InsufficientAmount);
+                parent_plan.amount = parent_plan.amount.checked_sub(user_plan.amount).ok_or(VestingError::Overflow)?;
+            }
+        }
+    } else {
+        let user_unreleased: Vec<&YearlyPlan> = user_plans.iter().filter(|p| !p.released).collect();
+        let parent_unreleased: Vec<&mut YearlyPlan> = parent_chunk.plans.iter_mut().filter(|p| !p.released).collect();
+        let mut parent_iter = parent_unreleased.into_iter().skip(1);
+
+        for user_plan in user_unreleased {
+            if let Some(parent_plan) = parent_iter.next() {
+                require!(parent_plan.amount >= user_plan.amount, VestingError::InsufficientAmount);
+                parent_plan.amount = parent_plan.amount.checked_sub(user_plan.amount).ok_or(VestingError::Overflow)?;
+            } else {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn refund_to_parent(parent_chunk: &mut VestingPlanChunk, user_plans: &[YearlyPlan]) -> Result<()> {
+    let user_tge_time = user_plans.first().map(|p| p.release_time);
+    let parent_tge_time = parent_chunk.plans.first().map(|p| p.release_time);
+    let tge_equal = user_tge_time == parent_tge_time;
+
+    if tge_equal {
+        for (user_plan, parent_plan) in user_plans.iter().zip(parent_chunk.plans.iter_mut()) {
+            if !user_plan.released {
+                parent_plan.amount = parent_plan.amount.checked_add(user_plan.amount).ok_or(VestingError::Overflow)?;
+            }
+        }
+    } else {
+        let user_unreleased: Vec<&YearlyPlan> = user_plans.iter().filter(|p| !p.released).collect();
+        let parent_unreleased: Vec<&mut YearlyPlan> = parent_chunk.plans.iter_mut().filter(|p| !p.released).collect();
+        let mut parent_iter = parent_unreleased.into_iter().skip(1);
+
+        for user_plan in user_unreleased {
+            if let Some(parent_plan) = parent_iter.next() {
+                parent_plan.amount = parent_plan.amount.checked_add(user_plan.amount).ok_or(VestingError::Overflow)?;
+            } else {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 // Store vesting information
@@ -858,19 +887,31 @@ pub struct AppendYearlyPlan<'info> {               // append_yearly_plan context
 }
 
 #[derive(Accounts)]
-pub struct UpdatePlanChunk<'info> {               // update_plan_chunk context
+pub struct UpdatePlanChunk<'info> {
     #[account(mut)]
+    pub vesting_account: Account<'info, VestingAccount>,
+
+    #[account(
+        mut,
+        seeds = [b"plans", vesting_account.key().as_ref()],
+        bump
+    )]
     pub plan_chunk: Account<'info, VestingPlanChunk>,
+
+    #[account(mut)]
+    pub parent_plan_chunk: Option<Account<'info, VestingPlanChunk>>,
 
     #[account(mut)]
     pub admin: Signer<'info>,
 
     #[account(
-        has_one = admin @ VestingError::Unauthorized, 
+        has_one = admin @ VestingError::Unauthorized,
         seeds = [b"admin"],
         bump
     )]
     pub admin_config: Account<'info, AdminConfig>,
+
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
