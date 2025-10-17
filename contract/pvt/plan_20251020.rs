@@ -782,7 +782,10 @@ pub struct UserCreateVesting<'info> {             // user_create_vesting context
     pub token_vault: Box<Account<'info, TokenAccount>>,       // Referenced vault
 
     // Primary wallet vault to transfer tokens to the secondary wallet
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = parent_vault.key() == parent_vesting_account.beneficiary_vault @ VestingError::InvalidParameters
+    )]
     pub parent_vault: Box<Account<'info, TokenAccount>>,      // Parent vault
 
     #[account(
