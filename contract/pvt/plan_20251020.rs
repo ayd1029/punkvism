@@ -395,22 +395,16 @@ pub mod vesting {
 
         if deduct {
             // Check if owned by this program
-            let parent_chunk_info = ctx
-                .accounts
-                .parent_plan_chunk
-                .as_ref()
-                .ok_or(VestingError::ParentPlanNotFoundOrNotUnique)?
-                .to_account_info();
-            require!(
-                parent_chunk_info.owner == ctx.program_id,
-                VestingError::Unauthorized
-            );
-
             let parent_chunk = ctx
                 .accounts
                 .parent_plan_chunk
-                .as_deref_mut()
+                .as_mut()
                 .ok_or(VestingError::ParentPlanNotFoundOrNotUnique)?;
+            
+            require!(
+                parent_chunk.to_account_info().owner == ctx.program_id,
+                VestingError::Unauthorized
+            );
 
             deduct_from_parent(parent_chunk, &plans)?;
         }
@@ -577,7 +571,10 @@ fn deduct_from_parent(
     Ok(())
 }
 
-fn refund_to_parent(parent_chunk: &mut VestingPlanChunk, user_plans: &[YearlyPlan]) -> Result<()> {
+fn refund_to_parent(
+    parent_chunk: &mut VestingPlanChunk,
+    user_plans: &[YearlyPlan],
+) -> Result<()> {
     let user_tge_time = user_plans.first().map(|p| p.release_time);
     let parent_tge_time = parent_chunk.plans.first().map(|p| p.release_time);
     let tge_equal = user_tge_time == parent_tge_time;
