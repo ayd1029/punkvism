@@ -146,7 +146,7 @@ pub mod vesting {
         // The backend finds the plan chunk corresponding to the vesting_account, and among them, finds the plan where release_time == vesting_time
         let vesting_plan = &mut ctx.accounts.plan_chunk;
 
-        let mut matching_plans: Vec<_> = vesting_plan
+        let mut matching_plans: Vec<&mut YearlyPlan> = vesting_plan
             .plans
             .iter_mut()
             .filter(|p| p.release_time == vesting_time && p.amount == amount && !p.released)
