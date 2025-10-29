@@ -1,15 +1,16 @@
-use anchor_lang::prelude::*; // Anchor basic prelude: Import accounts, macros, and types
+use anchor_lang::prelude::*;                          // Anchor basic prelude: Import accounts, macros, and types
 use anchor_spl::associated_token::get_associated_token_address; // SPL ATA utility: Function for calculating ATA
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer}; // Types/functions used for SPL Token CPI
 
-declare_id!("8uj42PDAmTiHYARoJk9kY3FU6vGxLSSfhzrwDVQMQP6d"); // Declare program ID (on-chain program id)
+declare_id!("DcjmKSSKNxbSAwBQZx8wSAhosxBxQoyz3DdXuysMiPTy"); // Declare program ID (on-chain program id)
 
-const CATEGORY_MAX_LEN: usize = 50; // Maximum length for the category string
-const TOKEN_NAME_MAX_LEN: usize = 32; // Maximum length for the token name string
-const TOKEN_SYMBOL_MAX_LEN: usize = 10; // Maximum length for the token symbol string
-const DISCRIMINATOR_SIZE: usize = 8; // Anchor account discriminator (8 bytes)
+const CATEGORY_MAX_LEN: usize = 50;                   // Maximum length for the category string
+const DISCRIMINATOR_SIZE: usize = 8;                  // Anchor account discriminator (8 bytes)
 const STRING_LENGTH_PREFIX: usize = 4; // String length prefix (u32) - Anchor prepends this during String serialization
-const MAX_PLANS: usize = 52; // Maximum number of yearly plans in a chunk
+const MAX_PLANS: usize = 52;                          // Maximum number of yearly plans in a chunk
+const TOKEN_NAME_MAX_LEN: usize = 32;                 // Maximum length for the token name string
+const TOKEN_SYMBOL_MAX_LEN: usize = 10;               // Maximum length for the token symbol string
+
 const VESTING_ACCOUNT_SPACE: usize = DISCRIMINATOR_SIZE
     + 32  // beneficiary (Pubkey)
     + 8   // total_amount
@@ -26,50 +27,48 @@ const VESTING_ACCOUNT_SPACE: usize = DISCRIMINATOR_SIZE
     + 32; // parent_vault - calculate total account space
 
 #[program]
-pub mod vesting {
-    use super::*; // Use symbols from the parent scope
-                  // Set deployer admin
-    pub fn initialize_deployer(ctx: Context<InitializeDeployer>) -> Result<()> {
-        // Register deployer
+pub mod vesting {                                      // Start of the Anchor program module
+    use super::*;                                     // Use symbols from the parent scope
+    // Set deployer admin
+    pub fn initialize_deployer(ctx: Context<InitializeDeployer>) -> Result<()> { // Register deployer
         let deployer_admin = &mut ctx.accounts.deploy_admin; // Get a handle to the PDA account
         deployer_admin.deployer = ctx.accounts.deployer.key(); // Record the deployer's Pubkey
         Ok(())
     }
 
     // Set admin account
-    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
-        // Deployer designates an admin
+    pub fn initialize(ctx: Context<Initialize>) -> Result<()> { // Deployer designates an admin
         require!(
             ctx.accounts.deployer_admin.deployer == ctx.accounts.deployer.key(), // Is the caller the registered deployer?
             VestingError::NotDeployAdmin
         );
         let admin_config = &mut ctx.accounts.admin_config; // Reference to the AdminConfig PDA
-        admin_config.admin = ctx.accounts.admin.key(); // Designate as admin
+        admin_config.admin = ctx.accounts.admin.key();      // Designate as admin
         Ok(())
     }
 
     pub fn do_vesting(
         ctx: Context<DoVesting>,
-        amount: u64,           // Amount to be released
-        vesting_time: i64,     // Release time
-        params: VestingParams, // Additional parameters like vesting_id
+        amount: u64,                                      // Amount to be released
+        vesting_time: i64,                                // Release time
+        params: VestingParams,                            // Additional parameters like vesting_id
     ) -> Result<()> {
-        let now = Clock::get()?; // Current on-chain time
+        let now = Clock::get()?;                          // Current on-chain time
         let vesting_account = &mut ctx.accounts.vesting_account; // Target vesting account
-        let admin = &ctx.accounts.admin; // Admin account (signer)
-        let admin_config = &ctx.accounts.admin_config; // Admin configuration
+        let admin = &ctx.accounts.admin;                   // Admin account (signer)
+        let admin_config = &ctx.accounts.admin_config;     // Admin configuration
 
         // Debug logs commented out
         // msg!("vesting_account = {}", vesting_account.key());
         // ...
 
         require!(
-            admin_config.admin == admin.key(), // Does the call signer match the registered admin?
+            admin_config.admin == admin.key(),            // Does the call signer match the registered admin?
             VestingError::Unauthorized
         );
         require!(vesting_account.is_active, VestingError::NotActive); // Is the vesting active?
         require!(
-            vesting_account.last_release_time <= now.unix_timestamp, // Has time passed since the last release?
+            vesting_account.last_release_time <= now.unix_timestamp,  // Has time passed since the last release?
             VestingError::VestingNotReached
         );
 
@@ -91,125 +90,112 @@ pub mod vesting {
         );
 
         require!(
-            vesting_time <= now.unix_timestamp, // Is the requested release time in the past or present?
+            vesting_time <= now.unix_timestamp,           // Is the requested release time in the past or present?
             VestingError::VestingNotReached
         );
         // token_vault, parent_vault
         // Verify origin_token_account PDA
-        let expected_origin_pda = Pubkey::find_program_address(
-            // Calculate the expected source Vault PDA
+        let expected_origin_pda = Pubkey::find_program_address( // Calculate the expected source Vault PDA
             &[
-                b"vault",                               // Fixed seed
-                ctx.accounts.beneficiary.key.as_ref(),  // Beneficiary key
-                ctx.accounts.token_mint.key().as_ref(), // Token Mint
-                &params.vesting_id.to_le_bytes(),       // vesting id
+                b"vault",                                     // Fixed seed
+                ctx.accounts.beneficiary.key.as_ref(),         // Beneficiary key
+                ctx.accounts.token_mint.key().as_ref(),        // Token Mint
+                &params.vesting_id.to_le_bytes(),              // vesting id
             ],
             ctx.program_id,
-        ).0; // Use only the PDA (pubkey)
+        ).0;                                                   // Use only the PDA (pubkey)
 
         require_keys_eq!(
-            ctx.accounts.origin_token_account.key(), // The actual origin vault passed in
-            expected_origin_pda,                     // Must be the same as what we calculated
+            ctx.accounts.origin_token_account.key(),           // The actual origin vault passed in
+            expected_origin_pda,                               // Must be the same as what we calculated
             VestingError::Unauthorized
         );
 
         // Verify destination_token_address ATA
-        let expected_ata = get_associated_token_address(
-            // Standard ATA for the beneficiary
+        let expected_ata = get_associated_token_address(       // Standard ATA for the beneficiary
             &ctx.accounts.beneficiary.key(),
             &ctx.accounts.token_mint.key(),
         );
 
-        let admin_ata = get_associated_token_address(
-            // ATA of the token minting wallet
+        let admin_ata = get_associated_token_address(          // ATA of the token minting wallet
             &ctx.accounts.token_info.mint_wallet_address,
             &ctx.accounts.token_mint.key(),
         );
 
         require_keys_eq!(
-            ctx.accounts.destination_token_account.mint, // The destination account's mint must match
+            ctx.accounts.destination_token_account.mint,       // The destination account's mint must match
             ctx.accounts.token_mint.key(),
             VestingError::InvalidMint
         );
 
-        let dest = &ctx.accounts.destination_token_account; // Destination token account
+        let dest = &ctx.accounts.destination_token_account;    // Destination token account
         let is_beneficiary_ata =
             dest.key() == expected_ata && dest.owner == ctx.accounts.beneficiary.key(); // Is it the beneficiary's ATA?
         let is_admin_ata =
             dest.key() == admin_ata && dest.owner == ctx.accounts.token_info.mint_wallet_address; // Is it the admin's (mint wallet) ATA?
 
         require!(
-            is_beneficiary_ata || is_admin_ata, // Must be one of the two to be allowed
+            is_beneficiary_ata || is_admin_ata,                // Must be one of the two to be allowed
             VestingError::Unauthorized
         );
 
         // The backend finds the plan chunk corresponding to the vesting_account, and among them, finds the plan where release_time == vesting_time
-        let vesting_plan = &mut ctx.accounts.plan_chunk;
-
-        let mut matching_plans: Vec<&mut YearlyPlan> = vesting_plan
+        let vesting_plan = &mut ctx.accounts.plan_chunk;       // Collection of plans for this vesting (PDA)
+        let mut matching_plan: Vec<&mut YearlyPlan> = vesting_plan
             .plans
             .iter_mut()
-            .filter(|p| p.release_time == vesting_time && p.amount == amount && !p.released)
+            .filter(|p| p.release_time == vesting_time)
             .collect();
-
-        require!(
-            matching_plans.len() == 1,
-            VestingError::ParentPlanNotFoundOrNotUnique
-        );
-
-        let plan = match (matching_plans.pop(), matching_plans.pop()) {
+        let plan = match (matching_plan.pop(), matching_plan.pop()) {
             (Some(plan), None) => Ok(plan),
-            _ => Err(VestingError::ParentPlanNotFoundOrNotUnique),
+            _ => Err(VestingError::InvalidParentPlan),
         }?;
 
         require!(
-            plan.release_time <= now.unix_timestamp, // Has the time for that plan passed?
+            plan.release_time <= now.unix_timestamp,           // Has the time for that plan passed?
             VestingError::VestingNotReached
         );
         require!(!plan.released, VestingError::AlreadyReleased); // Cannot proceed if the plan has already been released
         require!(plan.amount == amount, VestingError::InvalidParameters); // The requested amount must match the plan's amount
 
-        let admin_key = ctx.accounts.admin.key(); // Cache the admin key
-        let token_vault_key = ctx.accounts.token_vault.key(); // Token vault key
+        let admin_key = ctx.accounts.admin.key();              // Cache the admin key
+        let token_vault_key = ctx.accounts.token_vault.key();  // Token vault key
 
-        let (_vault_authority_pda, bump) = Pubkey::find_program_address(
-            // Calculate the vault authority PDA
+        let (_vault_authority_pda, bump) = Pubkey::find_program_address( // Calculate the vault authority PDA
             &[b"vault_auth", admin_key.as_ref(), token_vault_key.as_ref()],
             ctx.program_id,
         );
         let seeds = &[
-            b"vault_auth", // Authority PDA seeds
+            b"vault_auth",                                    // Authority PDA seeds
             admin_key.as_ref(),
             token_vault_key.as_ref(),
             &[bump],
         ];
 
-        token::transfer(
-            // SPL Token transfer CPI
+        token::transfer(                                       // SPL Token transfer CPI
             CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(), // Token program
+                ctx.accounts.token_program.to_account_info(),  // Token program
                 Transfer {
                     from: ctx.accounts.origin_token_account.to_account_info(), // Source
                     to: ctx.accounts.destination_token_account.to_account_info(), // Destination
                     authority: ctx.accounts.vault_authority.to_account_info(), // Authority (PDA)
                 },
-                &[seeds], // Sign with PDA signer
+                &[seeds],                                      // Sign with PDA signer
             ),
-            amount, // Transfer amount
+            amount,                                            // Transfer amount
         )?;
 
-        vesting_account.released_amount = vesting_account // Update cumulative released amount
+        vesting_account.released_amount = vesting_account       // Update cumulative released amount
             .released_amount
             .checked_add(amount)
             .ok_or(VestingError::Overflow)?;
         vesting_account.last_release_time = now.unix_timestamp; // Update last release time
-        plan.released = true; // Mark this plan as completed
+        plan.released = true;                                   // Mark this plan as completed
 
         Ok(())
     }
 
-    pub fn lockup_vault(ctx: Context<LockupVault>, amount: u64) -> Result<()> {
-        // Lock tokens from admin wallet to vault
+    pub fn lockup_vault(ctx: Context<LockupVault>, amount: u64) -> Result<()> { // Lock tokens from admin wallet to vault
         token::transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -224,11 +210,10 @@ pub mod vesting {
         Ok(())
     }
 
-    pub fn create_vesting(ctx: Context<CreateVesting>, params: VestingParams) -> Result<()> {
-        // Create vesting account
+    pub fn create_vesting(ctx: Context<CreateVesting>, params: VestingParams) -> Result<()> { // Create vesting account
         let _vesting_account_info = ctx.accounts.vesting_account.to_account_info(); // (Unused) account handle
         let vesting_account = &mut ctx.accounts.vesting_account; // Mutable reference
-        let _clock = Clock::get()?; // (Unused) time
+        let _clock = Clock::get()?;                              // (Unused) time
 
         // Check if admin
         require!(
@@ -249,31 +234,30 @@ pub mod vesting {
             VestingError::InvalidParameters
         );
 
-        let amount_to_transfer = params // Amount to move from parent_vault to beneficiary_vault
+        let amount_to_transfer = params                         // Amount to move from parent_vault to beneficiary_vault
             .total_amount
             .checked_sub(params.released_amount)
             .ok_or(VestingError::InvalidParameters)?;
 
         vesting_account.beneficiary = ctx.accounts.beneficiary.key(); // Beneficiary address
-        vesting_account.total_amount = params.total_amount; // Total vesting amount
-        vesting_account.released_amount = params.released_amount; // Already released amount (initial value allowed)
-        vesting_account.start_time = params.start_time; // Start time
-                                                        // vesting_account.cliff_time = params.cliff_time;            // (Comment) Cliff not used
-        vesting_account.end_time = params.end_time; // End time
-        vesting_account.token_mint = ctx.accounts.token_mint.key(); // Vesting token mint
+        vesting_account.total_amount = params.total_amount;           // Total vesting amount
+        vesting_account.released_amount = params.released_amount;     // Already released amount (initial value allowed)
+        vesting_account.start_time = params.start_time;               // Start time
+        // vesting_account.cliff_time = params.cliff_time;            // (Comment) Cliff not used
+        vesting_account.end_time = params.end_time;                   // End time
+        vesting_account.token_mint = ctx.accounts.token_mint.key();   // Vesting token mint
         vesting_account.token_vault = ctx.accounts.token_vault.key(); // Token vault
         vesting_account.beneficiary_vault = ctx.accounts.beneficiary_vault.key(); // Beneficiary vault
 
         vesting_account.destination_token_account = ctx.accounts.beneficiary_token_account.key(); // Final receiving account
-        vesting_account.category = params.category.clone(); // Category (Team/Marketing, etc.)
-        vesting_account.is_active = true; // Activate
+        vesting_account.category = params.category.clone();            // Category (Team/Marketing, etc.)
+        vesting_account.is_active = true;                              // Activate
         vesting_account.parent_vault = ctx.accounts.parent_vault.key(); // Record parent vault
 
         let admin_key = ctx.accounts.admin.key();
         let token_vault_key = ctx.accounts.token_vault.key();
 
-        let (_vault_auth, vault_auth_bump) = Pubkey::find_program_address(
-            // Authority PDA (bump)
+        let (_vault_auth, vault_auth_bump) = Pubkey::find_program_address( // Authority PDA (bump)
             &[b"vault_auth", admin_key.as_ref(), token_vault_key.as_ref()],
             ctx.program_id,
         );
@@ -285,8 +269,7 @@ pub mod vesting {
             &[vault_auth_bump],
         ];
 
-        token::transfer(
-            // Move parent_vault -> beneficiary_vault
+        token::transfer(                                               // Move parent_vault -> beneficiary_vault
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 Transfer {
@@ -305,8 +288,7 @@ pub mod vesting {
     pub fn user_create_vesting(
         ctx: Context<UserCreateVesting>,
         params: VestingParams,
-    ) -> Result<()> {
-        // Create user vesting based on parent plan
+    ) -> Result<()> {                                                   // Create user vesting based on parent plan
         let vesting_account = &mut ctx.accounts.vesting_account;
         let _clock = Clock::get()?;
 
@@ -326,8 +308,8 @@ pub mod vesting {
             VestingError::InvalidParameters
         );
 
-        let plans = &mut ctx.accounts.parent_plan_chunk.plans; // Parent plans
-        require!(!plans.is_empty(), VestingError::ParentPlanNotFoundOrNotUnique); // Not possible if parent plan does not exist
+        let plans = &mut ctx.accounts.parent_plan_chunk.plans;         // Parent plans
+        require!(!plans.is_empty(), VestingError::InvalidParentPlan);  // Not possible if parent plan does not exist
 
         let amount_to_transfer = params
             .total_amount
@@ -382,139 +364,107 @@ pub mod vesting {
     pub fn append_yearly_plan(
         ctx: Context<AppendYearlyPlan>,
         plans: Vec<YearlyPlan>,
-    ) -> Result<()> {
-        // Add yearly plan (and parent deduction logic)
+    ) -> Result<()> {                                                  // Add yearly plan (and parent deduction logic)
         require!(
             ctx.accounts.admin_config.admin == ctx.accounts.admin.key(), // Check admin
             VestingError::Unauthorized
         );
 
-        let chunk = &mut ctx.accounts.plan_chunk;
-        let deduct = ctx.accounts.vesting_account.token_vault.key()
-            != ctx.accounts.vesting_account.parent_vault.key(); // Perform parent deduction if different from parent vault
+        let chunk = &mut ctx.accounts.plan_chunk;                       // Target plan chunk
+        let is_user_vesting_account = ctx.accounts.vesting_account.token_vault.key()
+            != ctx.accounts.vesting_account.parent_vault.key();         // Perform parent deduction if different from parent vault
 
-        if deduct {
-            // Check if owned by this program
-            let parent_chunk = ctx
+        require!(chunk.plans.len() + plans.len() <= MAX_PLANS, VestingError::InsufficientSpace);
+        if is_user_vesting_account {
+            let parent_plan_chunk = ctx
                 .accounts
                 .parent_plan_chunk
                 .as_mut()
-                .ok_or(VestingError::ParentPlanNotFoundOrNotUnique)?;
-            
+                .ok_or(VestingError::InvalidParentPlan)?;               // Check for parent plan existence
+
+            // Check if owned by this program
             require!(
-                parent_chunk.to_account_info().owner == ctx.program_id,
+                parent_plan_chunk.to_account_info().owner == ctx.program_id,
                 VestingError::Unauthorized
             );
-
-            deduct_from_parent(parent_chunk, &plans)?;
+            take_from_parent_plan(parent_plan_chunk, &plans)?;   
         }
 
         chunk.vesting_account = ctx.accounts.vesting_account.key(); // Indicate the owning vesting account
-        chunk.plans.extend(plans); // Add plans
+        chunk.plans.extend(plans);                                   // Add plans
         Ok(())
     }
 
-    pub fn update_plan_chunk(ctx: Context<UpdatePlanChunk>, plans: Vec<YearlyPlan>) -> Result<()> {
-        // Replace all plans
+    pub fn update_plan_chunk(ctx: Context<UpdatePlanChunk>, plans: Vec<YearlyPlan>) -> Result<()> { // Replace all plans
         require!(
-            ctx.accounts.admin_config.admin == ctx.accounts.admin.key(),
+            ctx.accounts.admin_config.admin == ctx.accounts.admin.key(), // Check admin
             VestingError::Unauthorized
         );
+        
+        require!(plans.len() <= MAX_PLANS, VestingError::InsufficientSpace);
+        let chunk = &mut ctx.accounts.plan_chunk;
+        let is_user_vesting_account = ctx.accounts.vesting_account.token_vault.key()
+            != ctx.accounts.vesting_account.parent_vault.key();         // Perform parent deduction if different from parent vault
 
-        let plan_chunk = &mut ctx.accounts.plan_chunk;
-        let deduct = ctx.accounts.vesting_account.token_vault.key()
-            != ctx.accounts.vesting_account.parent_vault.key();
-
-        if deduct {
-            let parent_chunk_info = ctx
+        if is_user_vesting_account {
+            let parent_plan_chunk = ctx
                 .accounts
                 .parent_plan_chunk
-                .as_ref()
-                .ok_or(VestingError::ParentPlanNotFoundOrNotUnique)?
-                .to_account_info();
+                .as_mut()
+                .ok_or(VestingError::InvalidParentPlan)?;               // Check for parent plan existence
+
+            // Check if owned by this program
             require!(
-                parent_chunk_info.owner == ctx.program_id,
+                parent_plan_chunk.to_account_info().owner == ctx.program_id,
                 VestingError::Unauthorized
             );
-
-            let parent_chunk = ctx
-                .accounts
-                .parent_plan_chunk
-                .as_deref_mut()
-                .ok_or(VestingError::ParentPlanNotFoundOrNotUnique)?;
-
-            // "Refund" old plans
-            let old_plans = plan_chunk.plans.clone();
-            refund_to_parent(parent_chunk, &old_plans)?;
-
-            // "Deduct" new plans
-            deduct_from_parent(parent_chunk, &plans)?;
+            return_to_parent_plan(parent_plan_chunk, &chunk.plans)?;
+            take_from_parent_plan(parent_plan_chunk, &plans)?;   
         }
 
-        plan_chunk.plans.clear();
-        plan_chunk.plans.extend(plans);
+        chunk.plans.clear();                                     // Delete existing
+        chunk.plans.extend(plans);                               // Refill with new
 
         Ok(())
     }
 
     // Emergency stop function (change is_active state)
-    pub fn emergency_stop(ctx: Context<EmergencyStop>) -> Result<()> {
-        // Toggle between active/inactive
+    pub fn emergency_stop(ctx: Context<EmergencyStop>) -> Result<()> { // Toggle between active/inactive
         let vesting_account = &mut ctx.accounts.vesting_account;
-        vesting_account.is_active = !vesting_account.is_active; // Toggle
+        vesting_account.is_active = !vesting_account.is_active;        // Toggle
 
         Ok(())
     }
 
-    pub fn close_vesting_account(_ctx: Context<CloseVestingAccount>) -> Result<()> {
-        // (Handle only)
-        Ok(()) // Actual resource deallocation is performed by the account annotation
+    pub fn close_vesting_account(_ctx: Context<CloseVestingAccount>) -> Result<()> { // (Handle only)
+        Ok(())                                                         // Actual resource deallocation is performed by the account annotation
     }
 
-    pub fn remove_admin(ctx: Context<RemoveAdmin>) -> Result<()> {
-        // Remove admin (deployer only)
+    pub fn remove_admin(ctx: Context<RemoveAdmin>) -> Result<()> {    // Remove admin (deployer only)
         require!(
             ctx.accounts.deployer_admin.deployer == ctx.accounts.deployer.key(), // Check deployer
             VestingError::NotDeployAdmin
         );
 
-        Ok(()) // Actual close is handled in Accounts
+        Ok(())                                                         // Actual close is handled in Accounts
     }
 
-    pub fn init_token_info(ctx: Context<InitTokenInfo>, args: TokenInfoArgs) -> Result<()> {
-        // Register token metadata
+    pub fn init_token_info(ctx: Context<InitTokenInfo>, args: TokenInfoArgs) -> Result<()> { // Register token metadata
         require!(
             ctx.accounts.admin_config.admin == ctx.accounts.scheduler_admin.key(), // Is scheduler an admin?
             VestingError::Unauthorized
         );
+        require!(args.token_name.len() <= TOKEN_NAME_MAX_LEN, VestingError::InvalidParameters);
+        require!(args.token_symbol.len() <= TOKEN_SYMBOL_MAX_LEN, VestingError::InvalidParameters);
 
-        // Validate inputs
-        require!(
-            args.token_name.len() <= TOKEN_NAME_MAX_LEN,
-            VestingError::InvalidParameters
-        );
-        require!(
-            args.token_symbol.len() <= TOKEN_SYMBOL_MAX_LEN,
-            VestingError::InvalidParameters
-        );
+        let mint_authority = ctx.accounts.token_mint.mint_authority.ok_or(VestingError::InvalidMint)?;
+        require!(mint_authority == args.mint_wallet_address, VestingError::Unauthorized);
+        
+        let token_info = &mut ctx.accounts.token_info;                 // TokenInfo PDA
 
-        // Validate that the provided mint_wallet_address is the actual mint authority
-        let mint_authority = ctx
-            .accounts
-            .token_mint
-            .mint_authority
-            .ok_or(VestingError::InvalidMint)?;
-        require!(
-            mint_authority == args.mint_wallet_address,
-            VestingError::Unauthorized
-        );
-
-        let token_info = &mut ctx.accounts.token_info;
-
-        token_info.token_name = args.token_name;
+        token_info.token_name = args.token_name;                       // Set name/symbol/total supply/mint/minting wallet
         token_info.token_symbol = args.token_symbol;
         token_info.total_supply = args.total_supply;
-        // Set the token_mint from the context, not from args, to prevent mismatch
         token_info.token_mint = ctx.accounts.token_mint.key();
         token_info.mint_wallet_address = args.mint_wallet_address;
 
@@ -522,145 +472,143 @@ pub mod vesting {
     }
 }
 
-fn deduct_from_parent(
-    parent_chunk: &mut VestingPlanChunk,
-    user_plans: &[YearlyPlan],
-) -> Result<()> {
-    let user_tge_time = user_plans.first().map(|p| p.release_time);
-    let parent_tge_time = parent_chunk.plans.first().map(|p| p.release_time);
-    let tge_equal = user_tge_time == parent_tge_time;
+fn take_from_parent_plan(parent_plan_chunk: &mut VestingPlanChunk, plans: &[YearlyPlan]) -> Result<()> {
+    let child_tge_time = plans.first().map(|p| p.release_time);  // User plan first release (assuming TGE)
+    let parent_tge_time = parent_plan_chunk.plans.first().map(|p| p.release_time); // Parent first release
+    let is_early_bird = child_tge_time == parent_tge_time;           // Check if TGE is the same
 
-    if tge_equal {
-        for (user_plan, parent_plan) in user_plans.iter().zip(parent_chunk.plans.iter_mut()) {
-            if !user_plan.released && !parent_plan.released {
+    if is_early_bird {
+        require!(
+            plans.len() == parent_plan_chunk.plans.len(),
+            VestingError::InvalidParameters
+        );
+        // If TGE is the same, 1:1 matching (deduct only for released == false)
+        for (child_plan, parent_plan) in plans.iter().zip(parent_plan_chunk.plans.iter_mut()) {
+            if !child_plan.released && !parent_plan.released {
                 require!(
-                    parent_plan.amount >= user_plan.amount,
+                    parent_plan.amount >= child_plan.amount,
                     VestingError::InsufficientAmount
                 );
+
                 parent_plan.amount = parent_plan
                     .amount
-                    .checked_sub(user_plan.amount)
-                    .ok_or(VestingError::Overflow)?;
+                    .checked_sub(child_plan.amount)
+                    .ok_or(VestingError::Overflow)?;           // Deduct amount from parent plan
             }
         }
     } else {
-        let user_unreleased: Vec<&YearlyPlan> = user_plans.iter().filter(|p| !p.released).collect();
-        let parent_unreleased: Vec<&mut YearlyPlan> = parent_chunk
+        // If TGE is different: match and deduct from user false[0] and parent false[1]
+        // Extract only user plans where released == false
+        let child_unreleased: Vec<&YearlyPlan> =
+            plans.iter().filter(|p| !p.released).collect();
+        let parent_unreleased: Vec<&mut YearlyPlan> = parent_plan_chunk
             .plans
             .iter_mut()
             .filter(|p| !p.released)
             .collect();
+
+        // 1:1 correspondence from user 0, foundation 1
         let mut parent_iter = parent_unreleased.into_iter().skip(1);
 
-        for user_plan in user_unreleased {
+        for child_plan in child_unreleased {
             if let Some(parent_plan) = parent_iter.next() {
+                // Return error if foundation amount is insufficient
                 require!(
-                    parent_plan.amount >= user_plan.amount,
+                    parent_plan.amount >= child_plan.amount,
                     VestingError::InsufficientAmount
                 );
+
+                // Process deduction identically even if it's 0
                 parent_plan.amount = parent_plan
                     .amount
-                    .checked_sub(user_plan.amount)
+                    .checked_sub(child_plan.amount)
                     .ok_or(VestingError::Overflow)?;
             } else {
-                // If the parent plan runs out of slots to deduct from, the entire transaction must fail.
+                // If foundation plan is insufficient, stop further deductions and exit
                 return Err(VestingError::InsufficientAmount.into());
             }
         }
     }
+    
     Ok(())
 }
 
-fn refund_to_parent(
-    parent_chunk: &mut VestingPlanChunk,
-    user_plans: &[YearlyPlan],
-) -> Result<()> {
-    let user_tge_time = user_plans.first().map(|p| p.release_time);
-    let parent_tge_time = parent_chunk.plans.first().map(|p| p.release_time);
-    let tge_equal = user_tge_time == parent_tge_time;
+fn return_to_parent_plan(parent_plan_chunk: &mut VestingPlanChunk, plans: &[YearlyPlan]) -> Result<()> {
+    let child_tge_time = plans.first().map(|p| p.release_time);
+    let parent_tge_time = parent_plan_chunk.plans.first().map(|p| p.release_time);
+    let is_early_bird = child_tge_time == parent_tge_time;
 
-    if tge_equal {
-        for (user_plan, parent_plan) in user_plans.iter().zip(parent_chunk.plans.iter_mut()) {
-            if !user_plan.released {
+    if is_early_bird {
+        for (child_plan, parent_plan) in plans.iter().zip(parent_plan_chunk.plans.iter_mut()) {
+            if !child_plan.released {
                 parent_plan.amount = parent_plan
-                    .amount
-                    .checked_add(user_plan.amount)
+                    .amount.checked_add(child_plan.amount)
                     .ok_or(VestingError::Overflow)?;
             }
         }
     } else {
-        let user_unreleased: Vec<&YearlyPlan> = user_plans.iter().filter(|p| !p.released).collect();
-        let parent_unreleased: Vec<&mut YearlyPlan> = parent_chunk
-            .plans
-            .iter_mut()
-            .filter(|p| !p.released)
-            .collect();
+        let child_unreleased: Vec<&YearlyPlan> = plans.iter().filter(|p| !p.released).collect();
+    let parent_unreleased: Vec<&mut YearlyPlan> = parent_plan_chunk.plans.iter_mut().filter(|p| !p.released).collect();
         let mut parent_iter = parent_unreleased.into_iter().skip(1);
 
-        for user_plan in user_unreleased {
+        for child_plan in child_unreleased {
             if let Some(parent_plan) = parent_iter.next() {
-                parent_plan.amount = parent_plan
-                    .amount
-                    .checked_add(user_plan.amount)
+                parent_plan.amount = parent_plan.amount
+                    .checked_add(child_plan.amount)
                     .ok_or(VestingError::Overflow)?;
             } else {
-                break;
+                return Err(VestingError::InsufficientAmount.into());
             }
         }
     }
+    
     Ok(())
 }
 
 // Store vesting information
 #[account]
-pub struct VestingAccount {
-    // PDA to store vesting metadata
-    pub beneficiary: Pubkey,               // Beneficiary
-    pub total_amount: u64,                 // Total amount
-    pub released_amount: u64,              // Cumulative released amount
-    pub start_time: i64,                   // Start time (Unix)
-    pub end_time: i64,                     // End time (Unix)
-    pub last_release_time: i64,            // Last release time
-    pub token_mint: Pubkey,                // Token mint
-    pub token_vault: Pubkey,               // Vault (for this vesting)
-    pub beneficiary_vault: Pubkey,         // Beneficiary vault (PDA)
-    pub category: String,                  // Category (Team/Marketing, etc.)
-    pub is_active: bool,                   // Is active?
-    pub destination_token_account: Pubkey, // Final receiving token account (e.g., ATA)
-    pub parent_vault: Pubkey,              // Parent vault (primary wallet)
+pub struct VestingAccount {                         // PDA to store vesting metadata
+    pub beneficiary: Pubkey,                        // Beneficiary
+    pub total_amount: u64,                          // Total amount
+    pub released_amount: u64,                       // Cumulative released amount
+    pub start_time: i64,                            // Start time (Unix)
+    pub end_time: i64,                              // End time (Unix)
+    pub last_release_time: i64,                     // Last release time
+    pub token_mint: Pubkey,                         // Token mint
+    pub token_vault: Pubkey,                        // Vault (for this vesting)
+    pub beneficiary_vault: Pubkey,                  // Beneficiary vault (PDA)
+    pub category: String,                           // Category (Team/Marketing, etc.)
+    pub is_active: bool,                            // Is active?
+    pub destination_token_account: Pubkey,          // Final receiving token account (e.g., ATA)
+    pub parent_vault: Pubkey,                       // Parent vault (primary wallet)
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
-pub struct YearlyPlan {
-    // Yearly plan unit
-    pub release_time: i64, // Release time
-    pub amount: u64,       // Release amount
-    pub released: bool,    // Has it been released already?
+pub struct YearlyPlan {                             // Yearly plan unit
+    pub release_time: i64,                          // Release time
+    pub amount: u64,                                // Release amount
+    pub released: bool,                             // Has it been released already?
 }
 
 #[account]
-pub struct VestingPlanChunk {
-    // A bundle of plans (PDA)
-    pub vesting_account: Pubkey, // Which vesting does it belong to
-    pub plans: Vec<YearlyPlan>,  // Array of YearlyPlan
+pub struct VestingPlanChunk {                       // A bundle of plans (PDA)
+    pub vesting_account: Pubkey,                    // Which vesting does it belong to
+    pub plans: Vec<YearlyPlan>,                     // Array of YearlyPlan
 }
 
 // Account to store admin information
 #[account]
-pub struct AdminConfig {
-    // Admin configuration (PDA)
-    pub admin: Pubkey, // Admin key
+pub struct AdminConfig {                            // Admin configuration (PDA)
+    pub admin: Pubkey,                              // Admin key
 }
 
 #[account]
-pub struct DeployAdmin {
-    // Deployer configuration (PDA)
-    pub deployer: Pubkey, // Deployer key
+pub struct DeployAdmin {                            // Deployer configuration (PDA)
+    pub deployer: Pubkey,                           // Deployer key
 }
 
 #[derive(Accounts)]
-pub struct InitializeDeployer<'info> {
-    // initialize_deployer context
+pub struct InitializeDeployer<'info> {              // initialize_deployer context
     #[account(mut)]
     pub deployer: Signer<'info>, // Deployer = signer
 
@@ -671,17 +619,16 @@ pub struct InitializeDeployer<'info> {
         seeds = [b"deploy_admin"],
         bump
     )]
-    pub deploy_admin: Account<'info, DeployAdmin>, // PDA: ("deploy_admin")
+    pub deploy_admin: Account<'info, DeployAdmin>,  // PDA: ("deploy_admin")
 
-    pub system_program: Program<'info, System>, // System program
+    pub system_program: Program<'info, System>,     // System program
 }
 
 // Struct for setting admin during program initialization
 #[derive(Accounts)]
-pub struct Initialize<'info> {
-    // initialize context
+pub struct Initialize<'info> {                      // initialize context
     #[account(mut)]
-    pub deployer: Signer<'info>, // Deployer signer
+    pub deployer: Signer<'info>,                    // Deployer signer
 
     #[account(
         seeds = [b"deploy_admin"],                 // Reuse PDA created above
@@ -691,7 +638,7 @@ pub struct Initialize<'info> {
 
     // Scheduler address
     #[account(mut)]
-    pub admin: Signer<'info>, // Admin signer
+    pub admin: Signer<'info>,                       // Admin signer
 
     #[account(
         init,
@@ -707,24 +654,23 @@ pub struct Initialize<'info> {
 
 #[derive(Accounts)]
 #[instruction(amount: u64, vesting_time: i64, params: VestingParams)]
-pub struct DoVesting<'info> {
-    // do_vesting context definition
+pub struct DoVesting<'info> {                       // do_vesting context definition
     // Scheduler admin
     #[account(mut)]
-    pub admin: Signer<'info>, // Calling admin
+    pub admin: Signer<'info>,                       // Calling admin
 
     #[account(mut)]
-    pub token_vault: Account<'info, TokenAccount>, // Related vault (used for authority PDA calculation)
+    pub token_vault: Account<'info, TokenAccount>,  // Related vault (used for authority PDA calculation)
 
     /// CHECK: PDA used as authority for token_vault (seeds: [b"vault_auth", admin.key, token_vault.key])
-    pub vault_authority: UncheckedAccount<'info>, // PDA itself is verified with seeds/bump
+    pub vault_authority: UncheckedAccount<'info>,   // PDA itself is verified with seeds/bump
 
     #[account(
         mut,
         constraint = origin_token_account.mint == token_mint.key() @ VestingError::InvalidMint,
         constraint = origin_token_account.owner == vault_authority.key() @ VestingError::Unauthorized
     )]
-    pub origin_token_account: Account<'info, TokenAccount>, // Source token account (verification: PDA calculated directly above)
+    pub origin_token_account: Account<'info, TokenAccount>,   // Source token account (verification: PDA calculated directly above)
 
     #[account(
         mut,
@@ -744,7 +690,7 @@ pub struct DoVesting<'info> {
         seeds = [b"admin"],
         bump
     )]
-    pub admin_config: Account<'info, AdminConfig>, // Admin configuration PDA
+    pub admin_config: Account<'info, AdminConfig>,            // Admin configuration PDA
 
     #[account(
         mut,
@@ -760,27 +706,26 @@ pub struct DoVesting<'info> {
     pub token_info: Box<Account<'info, TokenInfo>>,
 
     /// CHECK: Beneficiary
-    pub beneficiary: AccountInfo<'info>, // Used for key check only
-    pub token_mint: Account<'info, Mint>, // Token mint
+    pub beneficiary: AccountInfo<'info>,                      // Used for key check only
+    pub token_mint: Account<'info, Mint>,                     // Token mint
 
-    pub token_program: Program<'info, Token>, // SPL Token Program
-    pub system_program: Program<'info, System>, // System Program
+    pub token_program: Program<'info, Token>,                 // SPL Token Program
+    pub system_program: Program<'info, System>,               // System Program
 }
 
 #[derive(Accounts)]
-pub struct LockupVault<'info> {
-    // lockup_vault context
+pub struct LockupVault<'info> {                    // lockup_vault context
     #[account(mut)]
     // Token issuer address
-    pub admin: Signer<'info>, // Admin signer
+    pub admin: Signer<'info>,                      // Admin signer
 
     /// CHECK: Scheduler address
     #[account(mut)]
-    pub scheduler_admin: AccountInfo<'info>, // Scheduler (can be matched with AdminConfig.admin)
+    pub scheduler_admin: AccountInfo<'info>,       // Scheduler (can be matched with AdminConfig.admin)
 
     #[account(mut)]
     pub admin_token_account: Account<'info, TokenAccount>, // Admin's token account
-    pub token_mint: Account<'info, Mint>, // Mint
+    pub token_mint: Account<'info, Mint>,                  // Mint
 
     #[account(
         init_if_needed,
@@ -797,7 +742,7 @@ pub struct LockupVault<'info> {
         seeds = [b"vault_auth", scheduler_admin.key().as_ref(), token_vault.key().as_ref()], // scheduler+vault
         bump
     )]
-    pub vault_authority: UncheckedAccount<'info>, // Vault authority PDA
+    pub vault_authority: UncheckedAccount<'info>,  // Vault authority PDA
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
@@ -806,11 +751,10 @@ pub struct LockupVault<'info> {
 // Create vesting
 #[derive(Accounts)]
 #[instruction(params: VestingParams)]
-pub struct CreateVesting<'info> {
-    // create_vesting context
+pub struct CreateVesting<'info> {                 // create_vesting context
     // Scheduler address
     #[account(mut)]
-    pub admin: Signer<'info>, // Admin signer
+    pub admin: Signer<'info>,                     // Admin signer
 
     #[account(
         has_one = admin @ VestingError::Unauthorized, // Must match AdminConfig.admin
@@ -835,17 +779,17 @@ pub struct CreateVesting<'info> {
         seeds = [b"vesting", beneficiary.key().as_ref(), token_mint.key().as_ref(), &params.vesting_id.to_le_bytes()], // beneficiary+mint+id
         bump
     )]
-    pub vesting_account: Account<'info, VestingAccount>, // New vesting account
+    pub vesting_account: Account<'info, VestingAccount>,      // New vesting account
 
     pub token_mint: Account<'info, Mint>,
 
     // Token minting wallet address + mint address
     #[account(mut)]
-    pub token_vault: Box<Account<'info, TokenAccount>>, // The vault this vesting references
+    pub token_vault: Box<Account<'info, TokenAccount>>,       // The vault this vesting references
 
     // Primary wallet vault to transfer tokens to the secondary wallet
     #[account(mut)]
-    pub parent_vault: Box<Account<'info, TokenAccount>>, // Parent vault (main)
+    pub parent_vault: Box<Account<'info, TokenAccount>>,      // Parent vault (main)
 
     #[account(
         init_if_needed,
@@ -855,14 +799,14 @@ pub struct CreateVesting<'info> {
         seeds = [b"vault", beneficiary.key().as_ref(), token_mint.key().as_ref(), &params.vesting_id.to_le_bytes()], // Beneficiary-specific Vault
         bump
     )]
-    pub beneficiary_vault: Account<'info, TokenAccount>, // User-specific Vault
+    pub beneficiary_vault: Account<'info, TokenAccount>,      // User-specific Vault
 
     /// CHECK: PDA used as the new authority for token_vault
     #[account(
         seeds = [b"vault_auth", admin.key().as_ref(), token_vault.key().as_ref()], // admin+token_vault 
         bump
     )]
-    pub vault_authority: UncheckedAccount<'info>, // Authority PDA (for transfer signature)
+    pub vault_authority: UncheckedAccount<'info>,             // Authority PDA (for transfer signature)
     // For primary wallet -> main vault -> on transfer, send from main vault to beneficiary_vault (primary wallet)
     #[account(mut)]
     pub beneficiary_token_account: Account<'info, TokenAccount>, // Beneficiary's final receiving ATA, etc.
@@ -874,8 +818,7 @@ pub struct CreateVesting<'info> {
 
 #[derive(Accounts)]
 #[instruction(params: VestingParams)]
-pub struct UserCreateVesting<'info> {
-    // user_create_vesting context
+pub struct UserCreateVesting<'info> {             // user_create_vesting context
     // Scheduler address
     #[account(mut)]
     pub admin: Signer<'info>,
@@ -909,14 +852,14 @@ pub struct UserCreateVesting<'info> {
 
     // Token minting wallet address + mint address
     #[account(mut)]
-    pub token_vault: Box<Account<'info, TokenAccount>>, // Referenced vault
+    pub token_vault: Box<Account<'info, TokenAccount>>,       // Referenced vault
 
     // Primary wallet vault to transfer tokens to the secondary wallet
     #[account(
         mut,
         constraint = parent_vault.key() == parent_vesting_account.beneficiary_vault @ VestingError::InvalidParameters
     )]
-    pub parent_vault: Box<Account<'info, TokenAccount>>, // Parent vault
+    pub parent_vault: Box<Account<'info, TokenAccount>>,      // Parent vault
 
     #[account(
         init_if_needed,
@@ -939,14 +882,14 @@ pub struct UserCreateVesting<'info> {
     pub beneficiary_token_account: Account<'info, TokenAccount>,
 
     #[account(mut)]
-    pub parent_vesting_account: Box<Account<'info, VestingAccount>>, // Parent vesting
+    pub parent_vesting_account: Box<Account<'info, VestingAccount>>,   // Parent vesting
 
     #[account(
         mut,
         seeds = [b"plans", parent_vesting_account.key().as_ref()],     // Parent plan chunk
         bump
     )]
-    pub parent_plan_chunk: Box<Account<'info, VestingPlanChunk>>, // Parent plans
+    pub parent_plan_chunk: Box<Account<'info, VestingPlanChunk>>,      // Parent plans
 
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
@@ -954,25 +897,24 @@ pub struct UserCreateVesting<'info> {
 }
 
 #[derive(Accounts)]
-pub struct AppendYearlyPlan<'info> {
-    // append_yearly_plan context
+pub struct AppendYearlyPlan<'info> {               // append_yearly_plan context
     #[account(mut)]
     pub vesting_account: Account<'info, VestingAccount>,
 
     #[account(
         init_if_needed,
         payer = admin,
-        space = 8 + 32 + 4 + (MAX_PLANS * (8 + 8 + 1)),   // MAX 52 plans (size calculation in comments)
+        space = 8 + 32 + 4 + (MAX_PLANS * (8 + 8 + 1)),                // Max 52 plans (size calculation in comments)
         seeds = [b"plans", vesting_account.key().as_ref()],
         bump
     )]
-    pub plan_chunk: Account<'info, VestingPlanChunk>, // Create/update the target plan chunk
+    pub plan_chunk: Account<'info, VestingPlanChunk>,                  // Create/update the target plan chunk
 
     #[account(mut)]
-    pub parent_plan_chunk: Option<Account<'info, VestingPlanChunk>>, // Parent plan (optional)
+    pub parent_plan_chunk: Option<Account<'info, VestingPlanChunk>>,   // Parent plan (optional)
 
     #[account(mut)]
-    pub admin: Signer<'info>, // Admin
+    pub admin: Signer<'info>,                                          // Admin
 
     #[account(
         has_one = admin @ VestingError::Unauthorized, 
@@ -985,17 +927,17 @@ pub struct AppendYearlyPlan<'info> {
 }
 
 #[derive(Accounts)]
-pub struct UpdatePlanChunk<'info> {
+pub struct UpdatePlanChunk<'info> {               // update_plan_chunk context
     #[account(mut)]
     pub vesting_account: Account<'info, VestingAccount>,
-
+    
     #[account(
         mut,
         seeds = [b"plans", vesting_account.key().as_ref()],
         bump
     )]
     pub plan_chunk: Account<'info, VestingPlanChunk>,
-
+    
     #[account(mut)]
     pub parent_plan_chunk: Option<Account<'info, VestingPlanChunk>>,
 
@@ -1003,18 +945,17 @@ pub struct UpdatePlanChunk<'info> {
     pub admin: Signer<'info>,
 
     #[account(
-        has_one = admin @ VestingError::Unauthorized,
+        has_one = admin @ VestingError::Unauthorized, 
         seeds = [b"admin"],
         bump
     )]
     pub admin_config: Account<'info, AdminConfig>,
-
+    
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-pub struct EmergencyStop<'info> {
-    // emergency_stop context
+pub struct EmergencyStop<'info> {                 // emergency_stop context
     #[account(mut)]
     pub admin: Signer<'info>,
 
@@ -1026,7 +967,7 @@ pub struct EmergencyStop<'info> {
     pub admin_config: Account<'info, AdminConfig>,
 
     /// CHECK: beneficiary account
-    pub beneficiary: AccountInfo<'info>, // Key check only
+    pub beneficiary: AccountInfo<'info>,          // Key check only
 
     pub token_mint: Account<'info, Mint>,
 
@@ -1039,19 +980,17 @@ pub struct EmergencyStop<'info> {
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
-pub struct VestingParams {
-    // Parameters for creating/releasing vesting
-    pub vesting_id: u64,      // Identifier (PDA seed)
-    pub total_amount: u64,    // Total amount
-    pub released_amount: u64, // Already released amount (initial transfer allowed)
-    pub start_time: i64,      // Start time
-    pub end_time: i64,        // End time
-    pub category: String,     // Category
+pub struct VestingParams {                        // Parameters for creating/releasing vesting
+    pub vesting_id: u64,                          // Identifier (PDA seed)
+    pub total_amount: u64,                        // Total amount
+    pub released_amount: u64,                     // Already released amount (initial transfer allowed)
+    pub start_time: i64,                          // Start time
+    pub end_time: i64,                            // End time
+    pub category: String,                         // Category
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
-pub struct VestingInfo {
-    // (For querying) Vesting summary info struct
+pub struct VestingInfo {                          // (For querying) Vesting summary info struct
     pub total_amount: u64,
     pub released_amount: u64,
     pub releasable_amount: u64,
@@ -1061,8 +1000,7 @@ pub struct VestingInfo {
 
 // Return PDA rent
 #[derive(Accounts)]
-pub struct CloseVestingAccount<'info> {
-    // close_vesting_account context
+pub struct CloseVestingAccount<'info> {           // close_vesting_account context
     // Scheduler admin
     #[account(mut)]
     pub admin: Signer<'info>,
@@ -1075,7 +1013,7 @@ pub struct CloseVestingAccount<'info> {
     pub admin_config: Account<'info, AdminConfig>,
 
     #[account(mut, close = admin)]
-    pub vesting_account: Account<'info, VestingAccount>, // On close, return rent to admin
+    pub vesting_account: Account<'info, VestingAccount>,      // On close, return rent to admin
 
     #[account(
         mut,
@@ -1095,10 +1033,9 @@ pub struct CloseVestingAccount<'info> {
 }
 
 #[derive(Accounts)]
-pub struct RemoveAdmin<'info> {
-    // remove_admin context
+pub struct RemoveAdmin<'info> {                   // remove_admin context
     #[account(mut)]
-    pub deployer: Signer<'info>, // Deployer signer
+    pub deployer: Signer<'info>,                  // Deployer signer
 
     #[account(
         seeds = [b"deploy_admin"],
@@ -1108,7 +1045,7 @@ pub struct RemoveAdmin<'info> {
 
     #[account(mut)]
     /// CHECK: admin account, ownership checks etc. are handled directly in the code
-    pub admin: AccountInfo<'info>, // Simple AccountInfo
+    pub admin: AccountInfo<'info>,                // Simple AccountInfo
 
     #[account(
         mut,
@@ -1116,12 +1053,11 @@ pub struct RemoveAdmin<'info> {
         seeds = [b"admin"],
         bump
     )]
-    pub admin_config: Account<'info, AdminConfig>, // Close AdminConfig and return rent to deployer
+    pub admin_config: Account<'info, AdminConfig>,           // Close AdminConfig and return rent to deployer
 }
 
 #[account]
-pub struct TokenInfo {
-    // Token metadata (PDA)
+pub struct TokenInfo {                            // Token metadata (PDA)
     pub token_name: String,
     pub token_symbol: String,
     pub total_supply: u64,
@@ -1130,33 +1066,32 @@ pub struct TokenInfo {
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize)]
-pub struct TokenInfoArgs {
-    // Input parameters for init_token_info
+pub struct TokenInfoArgs {                        // Input parameters for init_token_info
     pub token_name: String,
     pub token_symbol: String,
     pub total_supply: u64,
+    pub token_mint: Pubkey,
     pub mint_wallet_address: Pubkey,
 }
 
 #[derive(Accounts)]
-pub struct InitTokenInfo<'info> {
-    // init_token_info context
+pub struct InitTokenInfo<'info> {                 // init_token_info context
     #[account(mut)]
-    pub scheduler_admin: Signer<'info>, // Caller (scheduler admin)
+    pub scheduler_admin: Signer<'info>,           // Caller (scheduler admin)
 
     #[account(
         init,
         payer = scheduler_admin,
-        space = DISCRIMINATOR_SIZE 
-            + (STRING_LENGTH_PREFIX + TOKEN_NAME_MAX_LEN) 
-            + (STRING_LENGTH_PREFIX + TOKEN_SYMBOL_MAX_LEN) 
-            + 8  // total_supply
-            + 32 // token_mint
-            + 32, // mint_wallet_address (including String length prefix)
+        space = DISCRIMINATOR_SIZE
+            + (STRING_LENGTH_PREFIX + TOKEN_NAME_MAX_LEN)
+            + (STRING_LENGTH_PREFIX + TOKEN_SYMBOL_MAX_LEN)
+            + 8   // total_supply
+            + 32  // token_mint
+            + 32, // mint_wallet_address
         seeds = [b"token_info", scheduler_admin.key().as_ref(), token_mint.key().as_ref()],
         bump
     )]
-    pub token_info: Account<'info, TokenInfo>, // New TokenInfo PDA
+    pub token_info: Account<'info, TokenInfo>,    // New TokenInfo PDA
 
     #[account(
         seeds = [b"admin"],                      // Existing AdminConfig (read-only)
@@ -1164,40 +1099,39 @@ pub struct InitTokenInfo<'info> {
     )]
     pub admin_config: Account<'info, AdminConfig>,
 
-    pub token_mint: Account<'info, Mint>, // Mint
+    pub token_mint: Account<'info, Mint>,         // Mint
 
     pub system_program: Program<'info, System>,
 }
 
 #[error_code]
-pub enum VestingError {
-    // Custom error definitions
+pub enum VestingError {                           // Custom error definitions
     #[msg("Veseting period has not ended yet")]
-    VestingNotReached, // Release time not yet reached
+    VestingNotReached,                            // Release time not yet reached
     #[msg("No tokens available for release")]
-    NoTokensToRelease, // No tokens to release
+    NoTokensToRelease,                            // No tokens to release
     #[msg("Unauthorized operation")]
-    Unauthorized, // Unauthorized
+    Unauthorized,                                 // Unauthorized
     #[msg("Vesting is not active")]
-    NotActive, // Inactive state
+    NotActive,                                    // Inactive state
     #[msg("Invalid vesting parameters")]
-    InvalidParameters, // Invalid parameters
+    InvalidParameters,                            // Invalid parameters
     #[msg("Add amount is overflow")]
-    Overflow, // Overflow
+    Overflow,                                     // Overflow
     #[msg("You are not the deployer admin.")]
-    NotDeployAdmin, // Not the deployer
-    #[msg("Parent vesting plan must exist and unique.")]
-    ParentPlanNotFoundOrNotUnique, // Parent plan not found
+    NotDeployAdmin,                               // Not the deployer
+    #[msg("Invalid parent vesting plan.")]
+    InvalidParentPlan,                            // Invalid parent plan
     #[msg("Insufficient amount in the parent vesting plan.")]
-    InsufficientAmount, // Insufficient amount in parent plan
-    #[msg("Plans can be appended up to 52")]
-    InsufficientSpace,
+    InsufficientAmount,                           // Insufficient amount in parent plan
+    #[msg("Plans can be appended up to 52.")]
+    InsufficientSpace,                            // Insufficient space
     #[msg("Vesting for the specified time has already been completed.")]
-    AlreadyReleased, // Already released for this time
+    AlreadyReleased,                              // Already released for this time
     #[msg("Token not registered in token_info.")]
-    InvalidToken, // Unregistered token
+    InvalidToken,                                 // Unregistered token
     #[msg("Vault must be empty before closing the vesting account.")]
-    VaultNotEmpty, // Vault must have a zero balance
+    VaultNotEmpty,                                // Vault must have a zero balance
     #[msg("Invalid Mint")]
-    InvalidMint, // Mint mismatch
+    InvalidMint,                                  // Mint mismatch
 }
