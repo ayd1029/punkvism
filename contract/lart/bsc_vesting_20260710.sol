@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 contract VestingProgram is ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -116,6 +116,7 @@ contract VestingProgram is ReentrancyGuard {
 
     function initialize(address _admin) external {
         if (msg.sender != deployer) revert NotDeployAdmin();
+        if (_admin == address(0)) revert InvalidParameters();
         admin = _admin;
     }
 
@@ -135,6 +136,8 @@ contract VestingProgram is ReentrancyGuard {
 
     function lockupVault(address token, uint256 amount) external nonReentrant {
         if (msg.sender != admin) revert Unauthorized();
+        if (token == address(0)) revert InvalidToken();
+
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
     }
 
@@ -230,14 +233,12 @@ contract VestingProgram is ReentrancyGuard {
         );
     }
 
-    /* ========== APPEND YEARLY PLAN (Anchor append_yearly_plan) ========== */
-
     function appendYearlyPlan(
         address beneficiary,
         uint256 vestingId,
         address parentBeneficiary,
         uint256 parentVestingId,
-        YearlyPlan[] memory newPlans
+        YearlyPlan[] calldata newPlans
     ) external {
         if (msg.sender != admin) revert Unauthorized();
         if (newPlans.length == 0) revert InvalidParameters();
@@ -253,27 +254,49 @@ contract VestingProgram is ReentrancyGuard {
             bool tgeEqual =
                 newPlans[0].releaseTime == parentPlans[0].releaseTime;
 
-            uint256 parentIdx = tgeEqual ? 0 : 1;
+            if (tgeEqual) {
+                // TGE가 동일한 경우: parent와 child를 1:1 매칭
+                for (
+                    uint256 i = 0;
+                    i < newPlans.length && i < parentPlans.length;
+                    i++
+                ) {
+                    if (!newPlans[i].released && !parentPlans[i].released) {
+                        if (parentPlans[i].amount < newPlans[i].amount)
+                            revert InsufficientAmount();
 
-            for (uint256 i = 0; i < newPlans.length; i++) {
-                if (!newPlans[i].released) {
-                    while (
-                        parentIdx < parentPlans.length &&
-                        parentPlans[parentIdx].released
-                    ) parentIdx++;
+                        parentPlans[i].amount -= newPlans[i].amount;
+                    }
+                }
+            } else {
+                // TGE가 다른 경우: parent의 첫 번째 non-TGE tranche부터 순차 매칭
+                uint256 parentIdx = 1;
 
-                    if (parentIdx >= parentPlans.length) revert InsufficientAmount();
+                for (uint256 i = 0; i < newPlans.length; i++) {
+                    if (!newPlans[i].released) {
+                        while (
+                            parentIdx < parentPlans.length &&
+                            parentPlans[parentIdx].released
+                        ) {
+                            parentIdx++;
+                        }
 
-                    if (parentPlans[parentIdx].amount < newPlans[i].amount)
-                        parentPlans[parentIdx].amount = 0;
-                    else parentPlans[parentIdx].amount -= newPlans[i].amount;
-                    
-                    if (tgeEqual) parentIdx++;
+                        if (parentIdx >= parentPlans.length)
+                            revert InsufficientAmount();
+
+                        if (parentPlans[parentIdx].amount < newPlans[i].amount)
+                            revert InsufficientAmount();
+
+                        parentPlans[parentIdx].amount -= newPlans[i].amount;
+
+                        // 다음 parent tranche로 이동
+                        parentIdx++;
+                    }
                 }
             }
         }
 
-        // 2. 입력받은 새로운 플랜들을 자식 계정에 추가
+        // 새로운 플랜 추가
         for (uint256 i = 0; i < newPlans.length; i++) {
             plans[beneficiary][vestingId].push(newPlans[i]);
         }
@@ -498,11 +521,6 @@ contract VestingProgram is ReentrancyGuard {
 		}
 	}
 
-	
-	/**
-	 * @notice 기존의 베스팅 플랜을 모두 삭제하고 새로운 플랜 리스트로 교체합니다.
-	 * @dev Anchor의 update_plan_chunk와 동일한 기능을 수행합니다.
-	 */
     function updatePlanChunk(
         address beneficiary,
         uint256 vestingId,
@@ -510,17 +528,19 @@ contract VestingProgram is ReentrancyGuard {
     ) external {
         if (msg.sender != admin) revert Unauthorized();
         if (newPlans.length == 0) revert InvalidParameters();
-        
+
         VestingAccount storage v = vestings[beneficiary][vestingId];
-        if (v.beneficiary == address(0)) 
+        if (v.beneficiary == address(0))
             revert InvalidParameters();
+
+        // 변경 전 totalAmount 저장
+        uint256 oldTotalAmount = v.totalAmount;
 
         uint256 totalPlanned = 0;
         for (uint256 i = 0; i < newPlans.length; i++) {
             totalPlanned += newPlans[i].amount;
         }
 
-        // 데이터 정합성 강제 동기화 (LOC-06 해결)
         uint256 currentRemaining = v.totalAmount - v.releasedAmount;
         if (currentRemaining != totalPlanned) {
             if (totalPlanned > currentRemaining) {
@@ -529,9 +549,9 @@ contract VestingProgram is ReentrancyGuard {
                 uint256 diff = currentRemaining - totalPlanned;
                 vaultAllocated[v.vaultId] -= diff;
                 v.totalAmount -= diff;
-                
+
                 if (v.parentVaultId != bytes32(0)) {
-                    // 부모 정보는 storage에서 직접 찾기 어려우므로, 
+                    // 부모 정보는 storage에서 직접 찾기 어려우므로,
                     // 이 함수는 독립 베스팅이나 부모 베스팅 수정용으로 주로 사용됨을 가정
                     // (자식 베스팅의 경우 appendYearlyPlan에서 이미 처리됨)
                 }
@@ -542,6 +562,16 @@ contract VestingProgram is ReentrancyGuard {
 
         for (uint256 i = 0; i < newPlans.length; i++) {
             plans[beneficiary][vestingId].push(newPlans[i]);
+        }
+
+        // totalAmount가 변경된 경우 이벤트 발생
+        if (oldTotalAmount != v.totalAmount) {
+            emit PlanAdjusted(
+                beneficiary,
+                vestingId,
+                oldTotalAmount,
+                v.totalAmount
+            );
         }
     }
 	
