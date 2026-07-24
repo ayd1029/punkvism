@@ -1046,19 +1046,26 @@ fn take_from_parent_plan(parent_plan_chunk: &mut VestingPlanChunk, plans: &[Year
             plans.len() == parent_plan_chunk.plans.len(),
             VestingError::InvalidParameters
         );
-        // If TGE is the same, 1:1 matching (deduct only for released == false)
+        // same-TGE: 1:1 매칭 + 각 tranche release_time 동일 필수
+        // (첫 시각만 같다고 index로 이후 슬롯을 소모하면 정책 위반)
         for (child_plan, parent_plan) in plans.iter().zip(parent_plan_chunk.plans.iter_mut()) {
-            if !child_plan.released && !parent_plan.released {
-                require!(
-                    parent_plan.amount >= child_plan.amount,
-                    VestingError::InsufficientAmount
-                );
-
-                parent_plan.amount = parent_plan
-                    .amount
-                    .checked_sub(child_plan.amount)
-                    .ok_or(VestingError::Overflow)?;           // Deduct amount from parent plan
+            require!(
+                child_plan.release_time == parent_plan.release_time,
+                VestingError::InvalidParameters
+            );
+            if child_plan.released {
+                continue;
             }
+            require!(!parent_plan.released, VestingError::AlreadyReleased);
+            require!(
+                parent_plan.amount >= child_plan.amount,
+                VestingError::InsufficientAmount
+            );
+
+            parent_plan.amount = parent_plan
+                .amount
+                .checked_sub(child_plan.amount)
+                .ok_or(VestingError::Overflow)?;
         }
     } else {
         // If TGE is different: match and deduct from user false[0] and parent false[1]
@@ -1103,10 +1110,19 @@ fn return_to_parent_plan(parent_plan_chunk: &mut VestingPlanChunk, plans: &[Year
     let is_early_bird = child_tge_time == parent_tge_time;
 
     if is_early_bird {
+        require!(
+            plans.len() == parent_plan_chunk.plans.len(),
+            VestingError::InvalidParameters
+        );
         for (child_plan, parent_plan) in plans.iter().zip(parent_plan_chunk.plans.iter_mut()) {
+            require!(
+                child_plan.release_time == parent_plan.release_time,
+                VestingError::InvalidParameters
+            );
             if !child_plan.released {
                 parent_plan.amount = parent_plan
-                    .amount.checked_add(child_plan.amount)
+                    .amount
+                    .checked_add(child_plan.amount)
                     .ok_or(VestingError::Overflow)?;
             }
         }
