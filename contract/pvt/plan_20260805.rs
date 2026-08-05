@@ -793,7 +793,8 @@ pub mod vesting {                                      // Start of the Anchor pr
 
         token_info.token_name = args.token_name;                       // Set name/symbol/total supply/mint/minting wallet
         token_info.token_symbol = args.token_symbol;
-        token_info.total_supply = args.total_supply;
+        // total_supply는 instruction data가 아니라 Mint 계정 supply 스냅샷으로 기록 (PUA-44)
+        token_info.total_supply = ctx.accounts.token_mint.supply;
         token_info.token_mint = ctx.accounts.token_mint.key();
         token_info.mint_wallet_address = args.mint_wallet_address;
 
