@@ -453,14 +453,19 @@ pub mod vesting {                                      // Start of the Anchor pr
         // append는 미해지 스케줄만 추가 (부분 적용/중복 release_time 방지)
         validate_yearly_plans(&plans, true)?;
 
-        let chunk = &mut ctx.accounts.plan_chunk;
         require!(
-            chunk.plans.len() + plans.len() <= MAX_PLANS,
+            ctx.accounts.plan_chunk.plans.len() + plans.len() <= MAX_PLANS,
             VestingError::InsufficientSpace
         );
 
         // 기존 chunk와 합쳐도 release_time 중복이 없고 엄격 증가하도록 보장
-        ensure_no_duplicate_release_times(&chunk.plans, &plans)?;
+        ensure_no_duplicate_release_times(&ctx.accounts.plan_chunk.plans, &plans)?;
+
+        let append_amount: u64 = plans
+            .iter()
+            .map(|p| p.amount)
+            .try_fold(0u64, |acc, amount| acc.checked_add(amount))
+            .ok_or(VestingError::Overflow)?;
 
         let deduct = ctx.accounts.vesting_account.token_vault.key()
             != ctx.accounts.vesting_account.parent_vault.key();
@@ -508,19 +513,13 @@ pub mod vesting {                                      // Start of the Anchor pr
                 .try_fold(0u64, |acc, amount| acc.checked_add(amount))
                 .ok_or(VestingError::Overflow)?;
 
-            let user_unreleased_total: u64 = plans
-                .iter()
-                .map(|p| p.amount)
-                .try_fold(0u64, |acc, amount| acc.checked_add(amount))
-                .ok_or(VestingError::Overflow)?;
-
             let user_tge_time = plans.first().map(|p| p.release_time);
             let parent_tge_time = parent_chunk.plans.first().map(|p| p.release_time);
             let tge_equal = user_tge_time == parent_tge_time;
 
             if tge_equal {
                 require!(
-                    user_unreleased_total <= parent_available_amount,
+                    append_amount <= parent_available_amount,
                     VestingError::InsufficientAmount
                 );
                 // TGE 같으면 release_time으로 정확히 매칭
@@ -564,7 +563,7 @@ pub mod vesting {                                      // Start of the Anchor pr
                     .ok_or(VestingError::Overflow)?;
 
                 require!(
-                    user_unreleased_total <= parent_available_after_skip,
+                    append_amount <= parent_available_after_skip,
                     VestingError::InsufficientAmount
                 );
 
@@ -592,12 +591,67 @@ pub mod vesting {                                      // Start of the Anchor pr
                         .ok_or(VestingError::Overflow)?;
                 }
             }
-
-            chunk.plans.extend(plans);
-        } else {
-            // deduct == false (top-level vesting)인 경우 전체 적용
-            chunk.plans.extend(plans);
+            // parent_chunk mut borrow ends here
         }
+
+        // PUA-32: child append는 parent plan 차감과 함께 vault funding CPI 수행
+        if deduct {
+            let admin_key = ctx.accounts.admin.key();
+            let token_vault_key = ctx.accounts.token_vault.key();
+            let (_vault_auth, vault_auth_bump) = Pubkey::find_program_address(
+                &[b"vault_auth", admin_key.as_ref(), token_vault_key.as_ref()],
+                ctx.program_id,
+            );
+            let signer_seeds: &[&[u8]; 4] = &[
+                b"vault_auth",
+                admin_key.as_ref(),
+                token_vault_key.as_ref(),
+                &[vault_auth_bump],
+            ];
+
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.parent_vault.to_account_info(),
+                        to: ctx.accounts.beneficiary_vault.to_account_info(),
+                        authority: ctx.accounts.vault_authority.to_account_info(),
+                    },
+                    &[signer_seeds],
+                ),
+                append_amount,
+            )?;
+
+            ctx.accounts.vesting_account.total_amount = ctx
+                .accounts
+                .vesting_account
+                .total_amount
+                .checked_add(append_amount)
+                .ok_or(VestingError::Overflow)?;
+
+            let (parent_total, parent_released) = {
+                let parent = ctx
+                    .accounts
+                    .parent_vesting_account
+                    .as_mut()
+                    .ok_or(VestingError::InvalidParentPlan)?;
+                parent.total_amount = parent
+                    .total_amount
+                    .checked_sub(append_amount)
+                    .ok_or(VestingError::InsufficientAmount)?;
+                (parent.total_amount, parent.released_amount)
+            };
+            let parent_chunk = ctx
+                .accounts
+                .parent_plan_chunk
+                .as_ref()
+                .ok_or(VestingError::InvalidParentPlan)?;
+            assert_vesting_plan_cap(parent_total, parent_released, &parent_chunk.plans)?;
+        }
+
+        let chunk = &mut ctx.accounts.plan_chunk;
+        chunk.plans.extend(plans);
+        chunk.vesting_account = ctx.accounts.vesting_account.key();
 
         // plan 합계가 vesting cap(total_amount / released_amount)을 넘지 않는지 검증
         assert_vesting_plan_cap(
@@ -606,8 +660,6 @@ pub mod vesting {                                      // Start of the Anchor pr
             &chunk.plans,
         )?;
 
-        // chunk.vesting_account는 한 번만 설정
-        chunk.vesting_account = ctx.accounts.vesting_account.key();
         Ok(())
     }
 
@@ -1642,12 +1694,44 @@ pub struct AppendYearlyPlan<'info> {               // append_yearly_plan context
     )]
     pub plan_chunk: Account<'info, VestingPlanChunk>,                  // Create/update the target plan chunk
 
-    /// CHECK: parent plan chunk - must be PDA derived from parent_vesting_account if provided
+    /// parent plan chunk — child append(deduct) 시 필수
     #[account(mut)]
     pub parent_plan_chunk: Option<Account<'info, VestingPlanChunk>>,
 
-    /// CHECK: parent vesting account for validation
+    /// parent vesting — child append 시 total_amount 동기화 (PUA-29/32)
+    #[account(mut)]
     pub parent_vesting_account: Option<Account<'info, VestingAccount>>,
+
+    // Child vault (funded allocation) — PUA-32 funding CPI
+    #[account(
+        mut,
+        constraint = beneficiary_vault.key() == vesting_account.beneficiary_vault @ VestingError::InvalidParameters,
+        constraint = beneficiary_vault.mint == vesting_account.token_mint @ VestingError::InvalidMint,
+        constraint = beneficiary_vault.owner == vault_authority.key() @ VestingError::Unauthorized
+    )]
+    pub beneficiary_vault: Account<'info, TokenAccount>,
+
+    // Parent vault that funds the child append
+    #[account(
+        mut,
+        constraint = parent_vault.key() == vesting_account.parent_vault @ VestingError::InvalidParameters,
+        constraint = parent_vault.mint == vesting_account.token_mint @ VestingError::InvalidMint,
+        constraint = parent_vault.owner == vault_authority.key() @ VestingError::Unauthorized
+    )]
+    pub parent_vault: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = token_vault.key() == vesting_account.token_vault @ VestingError::InvalidParameters
+    )]
+    pub token_vault: Account<'info, TokenAccount>,
+
+    /// CHECK: PDA authority for parent/child vaults
+    #[account(
+        seeds = [b"vault_auth", admin.key().as_ref(), token_vault.key().as_ref()],
+        bump
+    )]
+    pub vault_authority: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub admin: Signer<'info>,
@@ -1659,6 +1743,7 @@ pub struct AppendYearlyPlan<'info> {               // append_yearly_plan context
     )]
     pub admin_config: Account<'info, AdminConfig>,
 
+    pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
 
