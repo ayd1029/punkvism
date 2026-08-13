@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;                          // Anchor basic prelude: Import accounts, macros, and types
 use anchor_spl::associated_token::get_associated_token_address; // SPL ATA utility: Function for calculating ATA
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer}; // Types/functions used for SPL Token CPI
+use anchor_spl::token::{self, CloseAccount, Mint, Token, TokenAccount, Transfer}; // Types/functions used for SPL Token CPI
 
 declare_id!("DcjmKSSKNxbSAwBQZx8wSAhosxBxQoyz3DdXuysMiPTy"); // Declare program ID (on-chain program id)
 
@@ -751,11 +751,71 @@ pub mod vesting {                                      // Start of the Anchor pr
     }
 
     pub fn close_vesting_account(ctx: Context<CloseVestingAccount>) -> Result<()> {
-        // funded vault는 이미 amount==0 constraint. 미해지 스케줄이 남아있으면 close 금지.
+        // PUA-19: 미해지 스케줄이 남아있으면 close 금지 (parent 재조정 없이 삭제 차단)
         require!(
             sum_unreleased_amount(&ctx.accounts.plan_chunk.plans)? == 0,
             VestingError::InvalidParameters
         );
+        require_keys_eq!(
+            ctx.accounts.plan_chunk.vesting_account,
+            ctx.accounts.vesting_account.key(),
+            VestingError::InvalidParameters
+        );
+
+        // dust / leftover sweep 목적지는 beneficiary ATA만 허용
+        let expected_ata = get_associated_token_address(
+            &ctx.accounts.beneficiary.key(),
+            &ctx.accounts.token_mint.key(),
+        );
+        require!(
+            ctx.accounts.destination_token_account.key() == expected_ata
+                && ctx.accounts.destination_token_account.owner
+                    == ctx.accounts.beneficiary.key(),
+            VestingError::Unauthorized
+        );
+
+        let admin_key = ctx.accounts.admin.key();
+        let token_vault_key = ctx.accounts.token_vault.key();
+        let (_vault_auth, vault_auth_bump) = Pubkey::find_program_address(
+            &[b"vault_auth", admin_key.as_ref(), token_vault_key.as_ref()],
+            ctx.program_id,
+        );
+        let signer_seeds: &[&[u8]; 4] = &[
+            b"vault_auth",
+            admin_key.as_ref(),
+            token_vault_key.as_ref(),
+            &[vault_auth_bump],
+        ];
+
+        // 잔액이 있으면 beneficiary ATA로 sweep 후 vault close (dust로 close 불가 방지)
+        let remaining = ctx.accounts.beneficiary_vault.amount;
+        if remaining > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.beneficiary_vault.to_account_info(),
+                        to: ctx.accounts.destination_token_account.to_account_info(),
+                        authority: ctx.accounts.vault_authority.to_account_info(),
+                    },
+                    &[signer_seeds],
+                ),
+                remaining,
+            )?;
+        }
+
+        token::close_account(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                CloseAccount {
+                    account: ctx.accounts.beneficiary_vault.to_account_info(),
+                    destination: ctx.accounts.admin.to_account_info(),
+                    authority: ctx.accounts.vault_authority.to_account_info(),
+                },
+                &[signer_seeds],
+            ),
+        )?;
+
         Ok(())
     }
 
@@ -1675,7 +1735,7 @@ pub struct VestingInfo {                          // (For querying) Vesting summ
     pub is_active: bool,
 }
 
-// Return PDA rent
+// Return PDA rent + close beneficiary vault (PUA-19)
 #[derive(Accounts)]
 pub struct CloseVestingAccount<'info> {           // close_vesting_account context
     // Scheduler admin
@@ -1689,7 +1749,14 @@ pub struct CloseVestingAccount<'info> {           // close_vesting_account conte
     )]
     pub admin_config: Account<'info, AdminConfig>,
 
-    #[account(mut, close = admin)]
+    #[account(
+        mut,
+        close = admin,
+        constraint = vesting_account.beneficiary == beneficiary.key() @ VestingError::Unauthorized,
+        constraint = vesting_account.token_mint == token_mint.key() @ VestingError::InvalidMint,
+        constraint = vesting_account.token_vault == token_vault.key() @ VestingError::Unauthorized,
+        constraint = vesting_account.beneficiary_vault == beneficiary_vault.key() @ VestingError::Unauthorized
+    )]
     pub vesting_account: Account<'info, VestingAccount>,      // On close, return rent to admin
 
     #[account(
@@ -1700,12 +1767,39 @@ pub struct CloseVestingAccount<'info> {           // close_vesting_account conte
     )]
     pub plan_chunk: Account<'info, VestingPlanChunk>,
 
+    /// CHECK: beneficiary — ATA 검증/관계 확인용
+    pub beneficiary: AccountInfo<'info>,
+
+    pub token_mint: Account<'info, Mint>,
+
+    /// vault_auth PDA seed에 사용하는 참조 vault
     #[account(
-        constraint = beneficiary_vault.key() == vesting_account.beneficiary_vault @ VestingError::Unauthorized,
-        constraint = beneficiary_vault.amount == 0 @ VestingError::VaultNotEmpty, // Close only if vault is empty
+        constraint = token_vault.mint == token_mint.key() @ VestingError::InvalidMint
+    )]
+    pub token_vault: Account<'info, TokenAccount>,
+
+    /// CHECK: PDA authority for beneficiary_vault
+    #[account(
+        seeds = [b"vault_auth", admin.key().as_ref(), token_vault.key().as_ref()],
+        bump
+    )]
+    pub vault_authority: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        constraint = beneficiary_vault.mint == token_mint.key() @ VestingError::InvalidMint,
+        constraint = beneficiary_vault.owner == vault_authority.key() @ VestingError::Unauthorized
     )]
     pub beneficiary_vault: Account<'info, TokenAccount>,
 
+    /// leftover/dust sweep destination (beneficiary ATA)
+    #[account(
+        mut,
+        constraint = destination_token_account.mint == token_mint.key() @ VestingError::InvalidMint
+    )]
+    pub destination_token_account: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
 
