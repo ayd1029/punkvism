@@ -668,6 +668,7 @@ pub mod vesting {                                      // Start of the Anchor pr
 
         // 미해지 스케줄 합계 변화분만큼 parent <-> child vault 토큰을 함께 이동
         // (플랜만 바꾸고 vault balance가 남는/부족한 불일치 방지)
+        // PUA-29: child 할당 변경 시 parent.total_amount도 동일 delta로 동기화
         if new_unreleased != old_unreleased {
             let admin_key = ctx.accounts.admin.key();
             let token_vault_key = ctx.accounts.token_vault.key();
@@ -682,10 +683,18 @@ pub mod vesting {                                      // Start of the Anchor pr
                 &[vault_auth_bump],
             ];
 
-            if new_unreleased > old_unreleased {
-                let delta = new_unreleased
+            let child_increased = new_unreleased > old_unreleased;
+            let delta = if child_increased {
+                new_unreleased
                     .checked_sub(old_unreleased)
-                    .ok_or(VestingError::Overflow)?;
+                    .ok_or(VestingError::Overflow)?
+            } else {
+                old_unreleased
+                    .checked_sub(new_unreleased)
+                    .ok_or(VestingError::Overflow)?
+            };
+
+            if child_increased {
                 token::transfer(
                     CpiContext::new_with_signer(
                         ctx.accounts.token_program.to_account_info(),
@@ -705,9 +714,6 @@ pub mod vesting {                                      // Start of the Anchor pr
                     .checked_add(delta)
                     .ok_or(VestingError::Overflow)?;
             } else {
-                let delta = old_unreleased
-                    .checked_sub(new_unreleased)
-                    .ok_or(VestingError::Overflow)?;
                 token::transfer(
                     CpiContext::new_with_signer(
                         ctx.accounts.token_program.to_account_info(),
@@ -726,6 +732,34 @@ pub mod vesting {                                      // Start of the Anchor pr
                     .total_amount
                     .checked_sub(delta)
                     .ok_or(VestingError::Overflow)?;
+            }
+
+            if is_user_vesting_account {
+                let (parent_total, parent_released) = {
+                    let parent = ctx
+                        .accounts
+                        .parent_vesting_account
+                        .as_mut()
+                        .ok_or(VestingError::InvalidParentPlan)?;
+                    if child_increased {
+                        parent.total_amount = parent
+                            .total_amount
+                            .checked_sub(delta)
+                            .ok_or(VestingError::InsufficientAmount)?;
+                    } else {
+                        parent.total_amount = parent
+                            .total_amount
+                            .checked_add(delta)
+                            .ok_or(VestingError::Overflow)?;
+                    }
+                    (parent.total_amount, parent.released_amount)
+                };
+                let parent_chunk = ctx
+                    .accounts
+                    .parent_plan_chunk
+                    .as_ref()
+                    .ok_or(VestingError::InvalidParentPlan)?;
+                assert_vesting_plan_cap(parent_total, parent_released, &parent_chunk.plans)?;
             }
         }
 
@@ -1643,7 +1677,8 @@ pub struct UpdatePlanChunk<'info> {               // update_plan_chunk context
     #[account(mut)]
     pub parent_plan_chunk: Option<Account<'info, VestingPlanChunk>>,
 
-    /// CHECK: parent vesting account — child update 시 parent plan 바인딩에 필요
+    /// parent vesting account — child update 시 plan 바인딩 + total_amount 동기화 (PUA-29)
+    #[account(mut)]
     pub parent_vesting_account: Option<Account<'info, VestingAccount>>,
 
     // Child vault (funded allocation)
