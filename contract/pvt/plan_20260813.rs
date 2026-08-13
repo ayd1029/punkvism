@@ -541,23 +541,12 @@ pub mod vesting {                                      // Start of the Anchor pr
                         .ok_or(VestingError::Overflow)?;
                 }
             } else {
-                // TGE 다르면: user[0]부터, parent unreleased[1]부터 1:1 매칭 차감
-                let parent_unreleased_indices: Vec<usize> = parent_chunk
-                    .plans
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, p)| !p.released)
-                    .map(|(i, _)| i)
-                    .collect();
+                // TGE 다르면: TGE(첫 unreleased) skip 후, amount > 0 후보만 1:1 차감 (PUA-34)
+                let parent_candidate_indices =
+                    different_tge_parent_candidate_indices(&parent_chunk.plans)?;
 
-                require!(
-                    parent_unreleased_indices.len() >= 2,
-                    VestingError::InvalidParameters
-                );
-
-                let parent_available_after_skip: u64 = parent_unreleased_indices
+                let parent_available_after_skip: u64 = parent_candidate_indices
                     .iter()
-                    .skip(1)
                     .map(|&idx| parent_chunk.plans[idx].amount)
                     .try_fold(0u64, |acc, amount| acc.checked_add(amount))
                     .ok_or(VestingError::Overflow)?;
@@ -567,13 +556,12 @@ pub mod vesting {                                      // Start of the Anchor pr
                     VestingError::InsufficientAmount
                 );
 
-                // parent 슬롯이 user plan보다 적으면 전체 revert (부분 적용 금지)
                 require!(
-                    parent_unreleased_indices.len().saturating_sub(1) >= plans.len(),
+                    parent_candidate_indices.len() >= plans.len(),
                     VestingError::InsufficientAmount
                 );
 
-                let mut parent_idx_iter = parent_unreleased_indices.iter().skip(1);
+                let mut parent_idx_iter = parent_candidate_indices.iter();
                 for user_plan in &plans {
                     let parent_idx = *parent_idx_iter
                         .next()
@@ -1220,36 +1208,26 @@ fn take_from_parent_plan(parent_plan_chunk: &mut VestingPlanChunk, plans: &[Year
                 .ok_or(VestingError::Overflow)?;
         }
     } else {
-        // If TGE is different: match and deduct from user false[0] and parent false[1]
-        // Extract only user plans where released == false
+        // different-TGE: TGE(첫 unreleased) skip 후 amount > 0 후보만 차감 (PUA-34)
         let child_unreleased: Vec<&YearlyPlan> =
             plans.iter().filter(|p| !p.released).collect();
-        let parent_unreleased: Vec<&mut YearlyPlan> = parent_plan_chunk
-            .plans
-            .iter_mut()
-            .filter(|p| !p.released)
-            .collect();
+        let parent_indices = different_tge_parent_candidate_indices(&parent_plan_chunk.plans)?;
 
-        // 1:1 correspondence from user 0, foundation 1
-        let mut parent_iter = parent_unreleased.into_iter().skip(1);
+        require!(
+            parent_indices.len() >= child_unreleased.len(),
+            VestingError::InsufficientAmount
+        );
 
-        for child_plan in child_unreleased {
-            if let Some(parent_plan) = parent_iter.next() {
-                // Return error if foundation amount is insufficient
-                require!(
-                    parent_plan.amount >= child_plan.amount,
-                    VestingError::InsufficientAmount
-                );
-
-                // Process deduction identically even if it's 0
-                parent_plan.amount = parent_plan
-                    .amount
-                    .checked_sub(child_plan.amount)
-                    .ok_or(VestingError::Overflow)?;
-            } else {
-                // If foundation plan is insufficient, stop further deductions and exit
-                return Err(VestingError::InsufficientAmount.into());
-            }
+        for (child_plan, &parent_idx) in child_unreleased.iter().zip(parent_indices.iter()) {
+            let parent_plan = &mut parent_plan_chunk.plans[parent_idx];
+            require!(
+                parent_plan.amount >= child_plan.amount,
+                VestingError::InsufficientAmount
+            );
+            parent_plan.amount = parent_plan
+                .amount
+                .checked_sub(child_plan.amount)
+                .ok_or(VestingError::Overflow)?;
         }
     }
     
@@ -1281,22 +1259,47 @@ fn return_to_parent_plan(parent_plan_chunk: &mut VestingPlanChunk, plans: &[Year
             }
         }
     } else {
-        let child_unreleased: Vec<&YearlyPlan> = plans.iter().filter(|p| !p.released).collect();
-    let parent_unreleased: Vec<&mut YearlyPlan> = parent_plan_chunk.plans.iter_mut().filter(|p| !p.released).collect();
-        let mut parent_iter = parent_unreleased.into_iter().skip(1);
+        // append / take 와 동일한 different-TGE 후보 semantics (PUA-34)
+        let child_unreleased: Vec<&YearlyPlan> =
+            plans.iter().filter(|p| !p.released).collect();
+        let parent_indices = different_tge_parent_candidate_indices(&parent_plan_chunk.plans)?;
 
-        for child_plan in child_unreleased {
-            if let Some(parent_plan) = parent_iter.next() {
-                parent_plan.amount = parent_plan.amount
-                    .checked_add(child_plan.amount)
-                    .ok_or(VestingError::Overflow)?;
-            } else {
-                return Err(VestingError::InsufficientAmount.into());
-            }
+        require!(
+            parent_indices.len() >= child_unreleased.len(),
+            VestingError::InsufficientAmount
+        );
+
+        for (child_plan, &parent_idx) in child_unreleased.iter().zip(parent_indices.iter()) {
+            let parent_plan = &mut parent_plan_chunk.plans[parent_idx];
+            parent_plan.amount = parent_plan
+                .amount
+                .checked_add(child_plan.amount)
+                .ok_or(VestingError::Overflow)?;
         }
     }
     
     Ok(())
+}
+
+/// PUA-34: different-TGE parent 후보 index (append / take / return 공통).
+/// 1) `!released` 필터
+/// 2) 첫 unreleased = TGE → `skip(1)`
+/// 3) 이후 consumed zero(`amount == 0`) 제외
+fn different_tge_parent_candidate_indices(plans: &[YearlyPlan]) -> Result<Vec<usize>> {
+    let unreleased: Vec<usize> = plans
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !p.released)
+        .map(|(i, _)| i)
+        .collect();
+
+    require!(unreleased.len() >= 2, VestingError::InvalidParameters);
+
+    Ok(unreleased
+        .into_iter()
+        .skip(1)
+        .filter(|&idx| plans[idx].amount > 0)
+        .collect())
 }
 
 // Store vesting information
