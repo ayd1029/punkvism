@@ -234,7 +234,7 @@ pub mod vesting {                                      // Start of the Anchor pr
     pub fn create_vesting(
         ctx: Context<CreateVesting>,
         params: VestingParams,
-        mut plans: Vec<YearlyPlan>,
+        plans: Vec<YearlyPlan>,
     ) -> Result<()> {
         // Create vesting account + install schedule atomically
         require!(
@@ -316,10 +316,7 @@ pub mod vesting {                                      // Start of the Anchor pr
         chunk.vesting_account = vesting_key;
         chunk.plans.clear();
         // top-level: parent tranche identity 없음
-        for plan in plans.iter_mut() {
-            plan.parent_plan_index = PARENT_PLAN_INDEX_UNSET;
-        }
-        chunk.plans.extend(plans);
+        chunk.plans.extend(unset_parent_plan_indices(plans));
 
         assert_vesting_plan_cap(
             params.total_amount,
@@ -333,7 +330,7 @@ pub mod vesting {                                      // Start of the Anchor pr
     pub fn user_create_vesting(
         ctx: Context<UserCreateVesting>,
         params: VestingParams,
-        mut plans: Vec<YearlyPlan>,
+        plans: Vec<YearlyPlan>,
     ) -> Result<()> {
         // Create child vesting + schedule + parent deduction atomically
         require!(
@@ -371,7 +368,7 @@ pub mod vesting {                                      // Start of the Anchor pr
 
         // parent 스케줄 차감을 토큰 이동/child plan 설치와 원자적으로 수행
         // (PUA-47: 차감 시 parent_plan_index 기록)
-        take_from_parent_plan(&mut ctx.accounts.parent_plan_chunk, &mut plans)?;
+        let plans = take_from_parent_plan(&mut ctx.accounts.parent_plan_chunk, plans)?;
 
         // child에 위임·이체한 만큼 parent.total_amount도 차감해
         // 이후 parent append가 위임 용량을 재사용하지 못하게 함 (PUA-42)
@@ -450,7 +447,7 @@ pub mod vesting {                                      // Start of the Anchor pr
 
     pub fn append_yearly_plan(
         ctx: Context<AppendYearlyPlan>,
-        mut plans: Vec<YearlyPlan>,
+        plans: Vec<YearlyPlan>,
     ) -> Result<()> {
         require!(
             ctx.accounts.admin_config.admin == ctx.accounts.admin.key(),
@@ -480,7 +477,7 @@ pub mod vesting {                                      // Start of the Anchor pr
         let deduct = ctx.accounts.vesting_account.token_vault.key()
             != ctx.accounts.vesting_account.parent_vault.key();
 
-        if deduct {
+        let plans = if deduct {
             // parent_plan_chunk가 제공된 경우 parent_vesting_account도 필수
             let parent_vesting_account = ctx
                 .accounts
@@ -504,109 +501,26 @@ pub mod vesting {                                      // Start of the Anchor pr
                 )?;
             } // parent_chunk_ref 여기서 drop
 
-            // 이제 mutable borrow (immutable 참조가 drop된 후)
-            let parent_chunk = ctx
-                .accounts
-                .parent_plan_chunk
-                .as_deref_mut()
-                .ok_or(VestingError::InvalidParentPlan)?;
-
-            // parent plans: 차감으로 amount가 0일 수 있으므로 release_time 유일성만 강제
-            validate_release_times_unique(&parent_chunk.plans)?;
-
-            // parent plans에서 사용 가능한 총량 계산 (unreleased plans의 합)
-            let parent_available_amount: u64 = parent_chunk
-                .plans
-                .iter()
-                .filter(|p| !p.released)
-                .map(|p| p.amount)
-                .try_fold(0u64, |acc, amount| acc.checked_add(amount))
-                .ok_or(VestingError::Overflow)?;
-
-            // PUA-46: TGE 판정은 incoming batch가 아니라 저장된 child 스케줄의 첫 tranche 기준
-            // (chunk가 비어 있는 최초 append만 incoming first로 fallback)
-            let user_tge_time = ctx
+            // PUA-46: TGE 판정은 저장된 child 스케줄 첫 tranche (비어 있으면 incoming)
+            let child_tge_time = ctx
                 .accounts
                 .plan_chunk
                 .plans
                 .first()
                 .map(|p| p.release_time)
                 .or_else(|| plans.first().map(|p| p.release_time));
-            let parent_tge_time = parent_chunk.plans.first().map(|p| p.release_time);
-            let tge_equal = user_tge_time == parent_tge_time;
 
-            if tge_equal {
-                require!(
-                    append_amount <= parent_available_amount,
-                    VestingError::InsufficientAmount
-                );
-                // TGE 같으면 release_time으로 정확히 매칭 + parent_plan_index 기록
-                for user_plan in plans.iter_mut() {
-                    let parent_idx = parent_chunk
-                        .plans
-                        .iter()
-                        .position(|p| p.release_time == user_plan.release_time && !p.released)
-                        .ok_or(VestingError::InvalidParameters)?;
+            let parent_chunk = ctx
+                .accounts
+                .parent_plan_chunk
+                .as_deref_mut()
+                .ok_or(VestingError::InvalidParentPlan)?;
 
-                    require!(
-                        parent_chunk.plans[parent_idx].amount >= user_plan.amount,
-                        VestingError::InsufficientAmount
-                    );
-
-                    parent_chunk.plans[parent_idx].amount = parent_chunk.plans[parent_idx]
-                        .amount
-                        .checked_sub(user_plan.amount)
-                        .ok_or(VestingError::Overflow)?;
-                    user_plan.parent_plan_index =
-                        u8::try_from(parent_idx).map_err(|_| VestingError::InvalidParameters)?;
-                }
-            } else {
-                // TGE 다르면: TGE(첫 unreleased) skip 후, amount > 0 후보만 1:1 차감 (PUA-34)
-                let parent_candidate_indices =
-                    different_tge_parent_candidate_indices(&parent_chunk.plans)?;
-
-                let parent_available_after_skip: u64 = parent_candidate_indices
-                    .iter()
-                    .map(|&idx| parent_chunk.plans[idx].amount)
-                    .try_fold(0u64, |acc, amount| acc.checked_add(amount))
-                    .ok_or(VestingError::Overflow)?;
-
-                require!(
-                    append_amount <= parent_available_after_skip,
-                    VestingError::InsufficientAmount
-                );
-
-                require!(
-                    parent_candidate_indices.len() >= plans.len(),
-                    VestingError::InsufficientAmount
-                );
-
-                let mut parent_idx_iter = parent_candidate_indices.iter();
-                for user_plan in plans.iter_mut() {
-                    let parent_idx = *parent_idx_iter
-                        .next()
-                        .ok_or(VestingError::InsufficientAmount)?;
-
-                    require!(
-                        parent_chunk.plans[parent_idx].amount >= user_plan.amount,
-                        VestingError::InsufficientAmount
-                    );
-
-                    parent_chunk.plans[parent_idx].amount = parent_chunk.plans[parent_idx]
-                        .amount
-                        .checked_sub(user_plan.amount)
-                        .ok_or(VestingError::Overflow)?;
-                    user_plan.parent_plan_index =
-                        u8::try_from(parent_idx).map_err(|_| VestingError::InvalidParameters)?;
-                }
-            }
-            // parent_chunk mut borrow ends here
+            deduct_parent_for_append(parent_chunk, child_tge_time, append_amount, plans)?
         } else {
             // top-level append: parent identity 없음
-            for plan in plans.iter_mut() {
-                plan.parent_plan_index = PARENT_PLAN_INDEX_UNSET;
-            }
-        }
+            unset_parent_plan_indices(plans)
+        };
 
         // PUA-32 / PUA-48: append 시 vault funding + total_amount 증가
         // - child(deduct): parent vault → child vault, parent.total_amount 차감
@@ -681,7 +595,7 @@ pub mod vesting {                                      // Start of the Anchor pr
         Ok(())
     }
 
-    pub fn update_plan_chunk(ctx: Context<UpdatePlanChunk>, mut plans: Vec<YearlyPlan>) -> Result<()> {
+    pub fn update_plan_chunk(ctx: Context<UpdatePlanChunk>, plans: Vec<YearlyPlan>) -> Result<()> {
         // Replace all plans
         require!(
             ctx.accounts.admin_config.admin == ctx.accounts.admin.key(),
@@ -704,7 +618,7 @@ pub mod vesting {                                      // Start of the Anchor pr
         let is_user_vesting_account = ctx.accounts.vesting_account.token_vault
             != ctx.accounts.vesting_account.parent_vault;
 
-        if is_user_vesting_account {
+        let plans = if is_user_vesting_account {
             let parent_vesting_account = ctx
                 .accounts
                 .parent_vesting_account
@@ -733,13 +647,11 @@ pub mod vesting {                                      // Start of the Anchor pr
                 .ok_or(VestingError::InvalidParentPlan)?;
 
             return_to_parent_plan(parent_plan_chunk, &ctx.accounts.plan_chunk.plans)?;
-            take_from_parent_plan(parent_plan_chunk, &mut plans)?;
+            take_from_parent_plan(parent_plan_chunk, plans)?
         } else {
             // top-level update: parent identity 없음
-            for plan in plans.iter_mut() {
-                plan.parent_plan_index = PARENT_PLAN_INDEX_UNSET;
-            }
-        }
+            unset_parent_plan_indices(plans)
+        };
 
         // 미해지 스케줄 합계 변화분만큼 parent <-> child vault 토큰을 함께 이동
         // (플랜만 바꾸고 vault balance가 남는/부족한 불일치 방지)
@@ -1219,13 +1131,106 @@ fn assert_vesting_plan_cap(
     Ok(())
 }
 
+fn unset_parent_plan_indices(mut plans: Vec<YearlyPlan>) -> Vec<YearlyPlan> {
+    for plan in plans.iter_mut() {
+        plan.parent_plan_index = PARENT_PLAN_INDEX_UNSET;
+    }
+    plans
+}
+
+/// append deduct 경로: parent 차감 + child plans에 parent_plan_index 기록
+fn deduct_parent_for_append(
+    parent_chunk: &mut VestingPlanChunk,
+    child_tge_time: Option<i64>,
+    append_amount: u64,
+    mut plans: Vec<YearlyPlan>,
+) -> Result<Vec<YearlyPlan>> {
+    validate_release_times_unique(&parent_chunk.plans)?;
+
+    let parent_available_amount: u64 = parent_chunk
+        .plans
+        .iter()
+        .filter(|p| !p.released)
+        .map(|p| p.amount)
+        .try_fold(0u64, |acc, amount| acc.checked_add(amount))
+        .ok_or(VestingError::Overflow)?;
+
+    let parent_tge_time = parent_chunk.plans.first().map(|p| p.release_time);
+    let tge_equal = child_tge_time == parent_tge_time;
+
+    if tge_equal {
+        require!(
+            append_amount <= parent_available_amount,
+            VestingError::InsufficientAmount
+        );
+        for user_plan in plans.iter_mut() {
+            let parent_idx = parent_chunk
+                .plans
+                .iter()
+                .position(|p| p.release_time == user_plan.release_time && !p.released)
+                .ok_or(VestingError::InvalidParameters)?;
+
+            require!(
+                parent_chunk.plans[parent_idx].amount >= user_plan.amount,
+                VestingError::InsufficientAmount
+            );
+
+            parent_chunk.plans[parent_idx].amount = parent_chunk.plans[parent_idx]
+                .amount
+                .checked_sub(user_plan.amount)
+                .ok_or(VestingError::Overflow)?;
+            user_plan.parent_plan_index =
+                u8::try_from(parent_idx).map_err(|_| VestingError::InvalidParameters)?;
+        }
+    } else {
+        let parent_candidate_indices =
+            different_tge_parent_candidate_indices(&parent_chunk.plans)?;
+
+        let parent_available_after_skip: u64 = parent_candidate_indices
+            .iter()
+            .map(|&idx| parent_chunk.plans[idx].amount)
+            .try_fold(0u64, |acc, amount| acc.checked_add(amount))
+            .ok_or(VestingError::Overflow)?;
+
+        require!(
+            append_amount <= parent_available_after_skip,
+            VestingError::InsufficientAmount
+        );
+        require!(
+            parent_candidate_indices.len() >= plans.len(),
+            VestingError::InsufficientAmount
+        );
+
+        let mut parent_idx_iter = parent_candidate_indices.iter();
+        for user_plan in plans.iter_mut() {
+            let parent_idx = *parent_idx_iter
+                .next()
+                .ok_or(VestingError::InsufficientAmount)?;
+
+            require!(
+                parent_chunk.plans[parent_idx].amount >= user_plan.amount,
+                VestingError::InsufficientAmount
+            );
+
+            parent_chunk.plans[parent_idx].amount = parent_chunk.plans[parent_idx]
+                .amount
+                .checked_sub(user_plan.amount)
+                .ok_or(VestingError::Overflow)?;
+            user_plan.parent_plan_index =
+                u8::try_from(parent_idx).map_err(|_| VestingError::InvalidParameters)?;
+        }
+    }
+
+    Ok(plans)
+}
+
 fn take_from_parent_plan(
     parent_plan_chunk: &mut VestingPlanChunk,
-    plans: &mut [YearlyPlan],
-) -> Result<()> {
+    mut plans: Vec<YearlyPlan>,
+) -> Result<Vec<YearlyPlan>> {
     // PUA-49: empty update(cancel) — 신규 차감 없음. TGE 오분류/≥2 게이트로 revert 방지
     if plans.is_empty() {
-        return Ok(());
+        return Ok(plans);
     }
 
     let child_tge_time = plans.first().map(|p| p.release_time);  // User plan first release (assuming TGE)
@@ -1291,7 +1296,7 @@ fn take_from_parent_plan(
         }
     }
 
-    Ok(())
+    Ok(plans)
 }
 
 fn return_to_parent_plan(parent_plan_chunk: &mut VestingPlanChunk, plans: &[YearlyPlan]) -> Result<()> {
